@@ -7,6 +7,7 @@ so no BF16 copy of the experts is ever materialized.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict
 
 import torch
@@ -30,6 +31,32 @@ from freetoken.layers import (
 from freetoken.moe.fused import moe_align_block_size
 
 _ACT = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
+
+# Phase E (expert branch): on SM75 the inline-dequant `_prefill_nvfp4_moe_kernel` runs
+# at ~0.76 TFLOPS because Triton emits 0 tensor-core MMA there (the Phase E2 sweep
+# proved it is a hard codegen limit, not tuning). FREETOKEN_E3_CUBLAS=1 routes the
+# *prefill* NVFP4 expert GEMM to a tensor-core path: a fused single-launch dequant of a
+# bounded group of experts (VRAM-bounded; the full-layer FP16 expansion does not fit on
+# the 8 GB card) + cuBLAS fp16 bmm + a vectorized sync-free scatter. Numerics match the
+# Triton kernel to fp16 rounding (rel-L2 ~8e-4). Decode is untouched (the marlin GEMV is
+# bandwidth-optimal). Gated so sm_89+ is never touched and only the plain *_and_mul
+# activations with the router weight on the gemm2 output (the model default) are routed.
+_E3_CUBLAS = os.environ.get("FREETOKEN_E3_CUBLAS") == "1"
+# group bounds the FP16 dequant transient (gu = group*2I*H*2 B = group*4 MiB). The 8 GB
+# card keeps only ~0.84 GiB free after load, and E1's dense temps + base activations
+# consume ~683 MB of it, so gu must stay <= ~140 MiB -> group=16 (gu=64 MiB). Larger
+# groups (64 -> 256 MiB) OOM at M>=512. Speed is ~independent of group (same total
+# dequant/bmm work; only the bmm batch shape changes).
+_E3_GROUP = int(os.environ.get("FREETOKEN_E3_GROUP", "16"))
+
+
+def _sm75_or_lower() -> bool:
+    """True on pre-Ampere / Turing-class parts (cap < (8,0)). Gated so sm_89+ is untouched."""
+    try:
+        cap = torch.cuda.get_device_capability()
+    except Exception:
+        return False
+    return cap < (8, 0)
 
 
 def _run_act(
@@ -314,6 +341,17 @@ def fused_experts_nvfp4(
     """Prefill inline-NVFP4 MoE. ``topk_ids`` index rows of the bank tensors in
     ``[0, num_experts)``: full-layer banks with position == expert id (the
     materialized ``[:E]`` slot view or the overlap double buffer), raw ids."""
+    # Phase E3: SM75 tensor-core NVFP4 prefill (gated; see _E3_CUBLAS above).
+    if (_E3_CUBLAS and _sm75_or_lower()
+            and not apply_router_weight_on_input
+            and activation in _ACT):
+        from freetoken.moe.fused_nvfp4_cublas import fused_experts_nvfp4_cublas
+
+        return fused_experts_nvfp4_cublas(
+            hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
+            down_packed, down_scale, down_global,
+            topk_weights, topk_ids, num_experts, activation, _E3_GROUP,
+        )
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up_packed.shape[1]

@@ -121,6 +121,48 @@ issue** — no block/warp/stage/transpose combination produces tensor-core MMA.
 **E2 is a dead end; E1 (cuBLAS fp16) is the correct fix.** Script:
 `scripts/sm75/e2_ptx_sweep.py`; detail: `artifacts/sm75-prefill/e2-results.md`.
 
+## Phase E (expert branch) — NVFP4 MoE prefill → tensor-core cuBLAS (COMPLETE, gates PASSED)
+
+After E1 cut the dense GEMM, the NVFP4 routed-expert GEMM became the dominant
+prefill cost (~65% of the E1 prefill). Its `_prefill_nvfp4_moe_kernel` dequantizes
+NVFP4 inline in the K-loop, but on SM75 Triton emits **0 tensor-core `mma`** (E2
+proved this is a hard codegen limitation) → ~0.76 TFLOPS, **136 ms/layer** at
+M=2048. **E3** routes the *prefill* NVFP4 expert GEMM through a tensor-core path:
+a **fused single-launch** Triton dequant (all experts in a group, one launch, global
+scale folded in so the GEMM is pure fp16) → **cuBLAS FP16 `bmm`** (gemm1+gemm2) →
+vectorized sync-free scatter. Decode + sm_89+ untouched. Gated behind
+`FREETOKEN_E3_CUBLAS=1` + `_sm75_or_lower()` + plain `*_and_mul` activation +
+router weight on gemm2 output (model default). `FREETOKEN_E3_GROUP=8` bounds the
+FP16 transient (~53 MiB at M=2048) to fit the 8 GB card alongside E1's dense temps.
+
+- **Files:** `moe/fused_nvfp4_cublas.py` (new, self-contained); `moe/fused_nvfp4.py`
+  (E3 gate + dispatch); `scripts/sm75/serve-e3.sh` (E1+E3, baseline flags,
+  loopback:1920); `scripts/sm75/e_experts_{isolate,decompose,dequant,e2e,correct,integration}.py`.
+- **Correctness (drop-in vs production `fused_experts_nvfp4`):** rel-L2 **0.000813**,
+  cosine **1.000000**, max abs 0.046875 — pure fp16 rounding. Integration through the
+  real dispatch: gate OFF 161.0 ms → gate ON **24.2 ms/layer (5.9×)**, rel-L2 0.000813.
+- **End-to-end A/B (E1+E3 vs baseline, 5 reps, loopback:1920, identical flags):**
+
+| workload | baseline | E1 | **E3 (E1+expert)** | vs base | E3 vs E1 | decode (base→E3) | cached |
+|---|---|---|---|---|---|---|---|
+| prefill-128 | 4033 ms | 1734 ms | **1713 ms** | 2.36× | 1.01× | – | – |
+| prefill-512 | 10906 ms | 3078 ms | **1744 ms** | 6.25× | 1.76× | – | – |
+| **prefill-2048** | **38979 ms** | **9734 ms** | **5768 ms** | **6.76×** | **1.69×** | – | – |
+| mixed-512 | 10941 ms | 2835 ms | **1749 ms** | 6.26× | 1.62× | 32.4→33.8 | – |
+| mixed-2048 | 38941 ms | 9807 ms | **5765 ms** | 6.75× | 1.70× | 32.3→33.0 | – |
+| prefix-cached | 1743 ms | 1738 ms | **1718 ms** | 1.01× | 1.01× | 31.2→32.3 | 1984→**1984** |
+| agent-envelope | 1766 ms | 1750 ms | **1728 ms** | 1.02× | 1.01× | 33.4→34.1 | 128 |
+
+- **Acceptance gates:** prefill-2048 **5768 ms ≤ 35100 ms → PASS** (6.76×, ~85% cut);
+  prefix-cache hit preserved (cached_tokens=1984 all reps) → PASS; decode
+  flat/slightly up (M==1 NVFP4 GEMV untouched); no NaN/Inf/crash across 42 rows.
+- **Memory:** three OOMs during integration each removed one transient (free
+  `gate_up` before `down`; per-group activation buffer instead of global; fold the
+  global scale into the dequant kernel to kill a 256 MiB fp32 temp). At group=8 the
+  peak E3 transient is ~53 MiB at M=2048, which fits alongside E1's dense temps.
+
+Full detail: `artifacts/sm75-prefill/e3-results.md`.
+
 ## Watch items / caveats
 
 - **`--max-prefill-length 2048`** caps prefill. The `prefill-4096` workload is **deferred** (will hit the cap / OOM on 8 GB). Baseline measured under the same cap for a fair A/B; 4096 to be added only if the cap is deliberately raised (logged) for both baseline and candidate.
@@ -131,12 +173,21 @@ issue** — no block/warp/stage/transpose combination produces tensor-core MMA.
 
 ## Next steps
 
-1. **Make E1 the default on SM75** (flip the `FREETOKEN_E1_CUBLAS` gate to on-by-default for cap < (8,0)) once this result is accepted — it is env-gated today for a clean A/B.
-2. **E2 — DONE, dead end** (see Phase E2 above): no Triton config emits `mma` on
-   SM75; a hand HMMA kernel is the only other tensor-core path and offers no gain
-   over E1.
-3. **Optional:** attack the NVFP4 expert GEMM (17% of prefill) for a further cut below the ~2 s non-GEMM floor.
-4. Add `prefill-4096` only if `--max-prefill-length` is deliberately raised (logged) for both baseline and candidate.
+1. **Phase G — end-to-end acceptance + final deliverables.** 12 required deliverables;
+   the 7-workload A/B (baseline/E1/E3) is done. Remaining: `docs/sm75-prefill.md`,
+   `final-report.md`, `environment-candidate.txt`, `build.log`, `summary.csv`,
+   `launch-candidate.sh`, `rollback.md`, plus the clean-restart reproducibility re-run
+   and the 20+ sequential request / chunked-vs-whole / partial-cache-hit correctness
+   sweep.
+2. **Make E1+E3 the default on SM75** (flip `FREETOKEN_E1_CUBLAS` and
+   `FREETOKEN_E3_CUBLAS` to on-by-default for cap < (8,0)) once accepted — env-gated
+   today for a clean A/B.
+3. **E2 — DONE, dead end** (see Phase E2): no Triton config emits `mma` on SM75.
+4. **NVFP4 expert GEMM — DONE** (Phase E expert branch, E3): 136 ms/layer → 24 ms;
+   the remaining prefill floor (~1.5–2 s: GDN, H2D offload, attention, routing) is
+   the only further target (Phase D native GDN / Phase F).
+5. Add `prefill-4096` only if `--max-prefill-length` is deliberately raised (logged)
+   for both baseline and candidate.
 
 ## Commands (exact)
 
