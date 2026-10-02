@@ -76,6 +76,40 @@ optimization branch from evidence. Gate: `profile-summary.md`.
 
 Full detail + reproduce steps: `artifacts/sm75-prefill/profile-summary.md`.
 
+## Phase E1 — Dense GEMM → cuBLAS FP16 (COMPLETE, gates PASSED)
+
+Implemented the Phase B branch (E1): on SM75, the **prefill (M>1)** dense GEMM now
+runs through a per-forward fp8→fp16 dequant + cuBLAS fp16 (tensor cores). Decode
+(M==1) stays on the W8A16 split-K GEMV (fp8 weight, bandwidth-optimal). Dequant is
+not cached (per-forward temp ~50 MB) → **no VRAM growth**. Gated behind
+`FREETOKEN_E1_CUBLAS=1` + `_sm75_or_lower()` (cap < (8,0)).
+
+- **Files:** `kernel/triton/fp8_pertensor_linear.py` (`_e1_dequant_cublas`,
+  `_sm75_or_lower`, dispatch branch); `scripts/sm75/serve-e1.sh` (baseline flags +
+  env flag); `scripts/sm75/e1_probe.py`, `e1_correctness.py`.
+- **Correctness:** E1 vs fp32 ref rel-L2 0.00029 (current W8A16: 0.00021) — same
+  numeric ballpark, no quality regression.
+- **End-to-end A/B (5 reps, loopback:1920, identical flags):**
+
+| workload | baseline | E1 | speedup | decode (base→E1) | cached (base→E1) |
+|---|---|---|---|---|---|
+| prefill-128 | 4033 ms | 1734 ms | 2.33× | – | – |
+| prefill-512 | 10906 ms | 3078 ms | 3.54× | – | – |
+| **prefill-2048** | **38979 ms** | **9734 ms** | **4.00×** | – | – |
+| mixed-512 | 10941 ms | 2835 ms | 3.86× | 32.4→32.7 | – |
+| mixed-2048 | 38941 ms | 9807 ms | 3.97× | 32.3→32.6 | – |
+| prefix-cached | 1743 ms | 1738 ms | 1.00× | 31.2→32.0 | 1984→**1984** |
+| agent-envelope | 1766 ms | 1750 ms | 1.01× | 33.4→33.4 | – |
+
+- **Acceptance gates:** prefill-2048 9734 ms ≤ 35100 ms → **PASS** (4.0×, ~75% cut,
+  matches the Amdahl prediction); prefix-cache hit preserved (cached_tokens=1984
+  all reps) → **PASS**; decode flat (no regression).
+- **Why not cache FP16:** +1.1 GB resident would OOM (only 0.84 GiB free after
+  load); per-forward dequant costs ~178 ms for the full prefill (negligible vs
+  9.7 s wall) and keeps the model fp8.
+
+Full detail: `artifacts/sm75-prefill/e1-results.md`.
+
 ## Watch items / caveats
 
 - **`--max-prefill-length 2048`** caps prefill. The `prefill-4096` workload is **deferred** (will hit the cap / OOM on 8 GB). Baseline measured under the same cap for a fair A/B; 4096 to be added only if the cap is deliberately raised (logged) for both baseline and candidate.
@@ -84,10 +118,12 @@ Full detail + reproduce steps: `artifacts/sm75-prefill/profile-summary.md`.
 - **Offload MoE backend** → decode does CPU↔GPU expert transfers; decode is slow. Mixed workloads (128 out) take minutes.
 - **First-request cold start** — the very first request after server start includes Triton JIT + first CUDA-graph replay (~34s). The `--warmup 1` per workload absorbs this; reported medians exclude warmup.
 
-## Next steps (after benchmark completes)
+## Next steps
 
-1. **A-12 Finalize** — compute per-workload medians (TTFT, decode tok/s, total) from `results.jsonl`; write `environment-candidate.txt`; commit the reproduced baseline on `baseline/local-sm75`; tag `baseline`; create `perf/sm75-prefill`.
-2. Optionally add `prefill-4096` if the cap is raised.
+1. **Make E1 the default on SM75** (flip the `FREETOKEN_E1_CUBLAS` gate to on-by-default for cap < (8,0)) once this result is accepted — it is env-gated today for a clean A/B.
+2. **Optional E2:** fix the Triton GEMM to emit tensor-core `mma` on SM75 (block/warp/stage search or hand kernel) — memory-neutral, also benefits decode, but lower payoff than E1 (decode GEMV is already bandwidth-optimal).
+3. **Optional:** attack the NVFP4 expert GEMM (17% of prefill) for a further cut below the ~2 s non-GEMM floor.
+4. Add `prefill-4096` only if `--max-prefill-length` is deliberately raised (logged) for both baseline and candidate.
 
 ## Commands (exact)
 

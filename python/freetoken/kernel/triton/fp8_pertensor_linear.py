@@ -41,6 +41,35 @@ _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float
 # (numeric reference / A-B debugging). Evaluated once; the kernels are the default.
 _USE_REF = os.environ.get("FREETOKEN_DEBUG_FP8_REF") == "1"
 
+# Phase E1: on SM75 (Turing) the Triton W8A16 `_gemm`/`_gemv` lower `tl.dot` to scalar
+# CUDA-core fp16 FMA (0 tensor-core mma) -> ~0.16 TFLOPS, ~160x slower than cuBLAS fp16.
+# FREETOKEN_E1_CUBLAS=1 routes the *prefill* (M>1) dense GEMM through a per-forward fp8->fp16
+# dequant + cuBLAS fp16 (tensor cores). Decode (M==1) stays on the W8A16 split-K GEMV (it reads
+# the fp8 weight once, which is the bandwidth-optimal decode path; dequantizing to fp16 there
+# would double the GEMV weight traffic). The dequant is NOT cached (per-forward temp, ~50 MB),
+# so the resident model stays fp8 and there is no VRAM growth. See profile-summary.md.
+_E1_CUBLAS = os.environ.get("FREETOKEN_E1_CUBLAS") == "1"
+
+
+def _sm75_or_lower() -> bool:
+    """True on pre-Ampere / Turing-class parts (cap < (8,0)) where the Triton W8A16 GEMM
+    loses badly to cuBLAS fp16. Gated so sm_89+ (native fp8 W8A8) is never touched."""
+    try:
+        cap = torch.cuda.get_device_capability()
+        return cap[0] < 8
+    except Exception:
+        return False
+
+
+def _e1_dequant_cublas(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+                       out_dtype: torch.dtype) -> torch.Tensor:
+    """``x @ (fp8*weight_scale)^T`` via per-forward fp8->``out_dtype`` dequant + cuBLAS.
+    ``weight`` is the fp8 view (fp8 or the uint8 kernel view); ``weight_scale`` [N] fp32.
+    Numerics ~= the W8A16 kernel (rel-L2 3e-4 vs fp32 ref); the dequant temp is freed on return."""
+    w = weight.view(FP8) if weight.dtype == torch.uint8 else weight
+    w16 = w.to(out_dtype) * weight_scale.to(out_dtype).unsqueeze(-1)  # [N, K] dequant
+    return x @ w16.t()
+
 
 # ======================================================================================
 # Decode (M==1) split-K GEMV: raw fp8 x bf16 reduction in fp32, per-row scale at reduce.
@@ -275,6 +304,10 @@ def fp8_pertensor_linear(
         ).reshape(*lead, N)
     elif x.numel() // K == 1:
         out = _gemv(x.reshape(K), e4m3_kernel_view(weight), weight_scale, x.dtype).reshape(*lead, N)
+    elif _E1_CUBLAS and _sm75_or_lower():
+        # Phase E1: prefill dense GEMM via per-forward fp8->fp16 dequant + cuBLAS (tensor cores)
+        # on SM75. Decode (M==1) above is untouched (W8A16 GEMV reads the fp8 weight once).
+        out = _e1_dequant_cublas(x.reshape(-1, K), weight, weight_scale, x.dtype).reshape(*lead, N)
     else:
         out = _gemm(
             x.reshape(-1, K), e4m3_kernel_view(weight), weight_scale, x.dtype,
