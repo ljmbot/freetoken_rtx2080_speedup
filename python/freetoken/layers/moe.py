@@ -269,12 +269,15 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
     ):
-        topk_weights, topk_ids = fused_topk(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=self.top_k,
-            renormalize=self.renormalize,
-        )
+        from freetoken.profiling import nvtx_range
+
+        with nvtx_range("MoE_topk"):
+            topk_weights, topk_ids = fused_topk(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=self.top_k,
+                renormalize=self.renormalize,
+            )
         return self._prefill_routed(hidden_states, topk_weights, topk_ids)
 
     # ------------------------------------------------------------------
@@ -383,32 +386,38 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        from freetoken.profiling import nvtx_range
+
         if cache.prefill_overlap:
-            views = self._wait_prefill_overlap(cache)
-            out = self._expert_gemm(
+            with nvtx_range("MoE_h2d_wait"):
+                views = self._wait_prefill_overlap(cache)
+            with nvtx_range("MoE_expert_gemm"):
+                out = self._expert_gemm(
+                    cache,
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    views=views,
+                    n=self.num_experts,
+                    alphas=cache.alphas_for_layer(self.layer_id),
+                    is_prefill=True,
+                )
+            cache.release_prefill_layer(self.layer_id)
+            return out
+        with nvtx_range("MoE_h2d_wait"):
+            cache.materialize_layer(self.layer_id)
+            cache.copy_missing()
+        with nvtx_range("MoE_expert_gemm"):
+            return self._expert_gemm(
                 cache,
                 hidden_states,
                 topk_weights,
                 topk_ids,
-                views=views,
+                views=cache.bank_views(self.num_experts),
                 n=self.num_experts,
                 alphas=cache.alphas_for_layer(self.layer_id),
                 is_prefill=True,
             )
-            cache.release_prefill_layer(self.layer_id)
-            return out
-        cache.materialize_layer(self.layer_id)
-        cache.copy_missing()
-        return self._expert_gemm(
-            cache,
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            views=cache.bank_views(self.num_experts),
-            n=self.num_experts,
-            alphas=cache.alphas_for_layer(self.layer_id),
-            is_prefill=True,
-        )
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the

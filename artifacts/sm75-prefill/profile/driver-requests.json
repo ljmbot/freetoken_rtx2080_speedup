@@ -1,0 +1,42 @@
+[
+  {
+    "name": "warm-512",
+    "content_tokens": 512,
+    "full_tokens": 521,
+    "server_prompt_tokens": 523,
+    "cached_tokens": null,
+    "ttft_ms": 11611.409985000137,
+    "total_ms": 11613.964002999637,
+    "content_tokens_out": 1
+  },
+  {
+    "name": "warm-2048",
+    "content_tokens": 2048,
+    "full_tokens": 2057,
+    "server_prompt_tokens": 2059,
+    "cached_tokens": null,
+    "ttft_ms": 38644.07385099912,
+    "total_ms": 38647.0575989988,
+    "content_tokens_out": 1
+  },
+  {
+    "name": "target-512",
+    "content_tokens": 512,
+    "full_tokens": 521,
+    "server_prompt_tokens": 523,
+    "cached_tokens": null,
+    "ttft_ms": 12683.602023000276,
+    "total_ms": 12685.936737001612,
+    "content_tokens_out": 1
+  },
+  {
+    "name": "target-2048",
+    "content_tokens": 2048,
+    "full_tokens": 2057,
+    "server_prompt_tokens": 2059,
+    "cached_tokens": null,
+    "ttft_ms": 40184.062823000204,
+    "total_ms": 40186.435618999894,
+    "content_tokens_out": 1
+  }
+]

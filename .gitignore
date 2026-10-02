@@ -232,3 +232,7 @@ benchmarks/cross_framework
 reference/FlashQLA-SM70-SM75/
 artifacts/sm75-prefill/traces/
 *.trace
+# Phase B: large raw chrome traces are reproducible (serve-profile.sh + profile_driver.py);
+# keep only the small per-op tables + backend report + driver log.
+artifacts/sm75-prefill/profile/prefill-*.json
+artifacts/sm75-prefill/serve-profile.log

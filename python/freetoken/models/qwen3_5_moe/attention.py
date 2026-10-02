@@ -82,10 +82,15 @@ class Qwen3_5Attention(BaseOP):
 
     @nvtx_annotate("MHA")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.profiling import nvtx_range
+
         ctx = get_global_ctx()
-        q, k, v, gate = self._project(x)
-        o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
-        return self._combine(o, gate)
+        with nvtx_range("MHA_qkv_proj"):
+            q, k, v, gate = self._project(x)
+        with nvtx_range("MHA_attn_kernel"):
+            o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
+        with nvtx_range("MHA_o_proj"):
+            return self._combine(o, gate)
 
 
 __all__ = ["Qwen3_5Attention"]

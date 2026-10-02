@@ -422,6 +422,105 @@ class Engine:
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
 
+        if os.environ.get("FREETOKEN_PROFILE", "0") == "1":
+            self._emit_backend_report()
+
+    def _emit_backend_report(self) -> None:
+        """Observable backend selection (Phase B part 1). Dumps what actually got
+        selected -- GPU/capability, dtypes, GDN/attention/MoE backends, expert
+        placement, CUDA-graph status, fallbacks -- so the profile-summary can cite
+        concrete evidence rather than assume which code path ran."""
+        import json
+
+        mc = self.config.model_config
+        report = {
+            "gpu": {
+                "name": torch.cuda.get_device_name(0),
+                "capability": torch.cuda.get_device_capability(0),
+                "memory_total_mib": round(
+                    torch.cuda.get_device_properties(0).total_memory / (1 << 20)
+                ),
+            },
+            "dtype": str(self.dtype),
+            "max_prefill_length": getattr(self.config, "max_prefill_length", None),
+            "max_seq_len": self.max_seq_len,
+            "num_pages": self.num_pages,
+            "attention_backend": self.config.attention_backend,
+            "moe_backend": self.config.moe_backend,
+            "nvfp4_backend": self.config.nvfp4_backend,
+            "moe_cache_size": self.config.moe_cache_size,
+            "moe_prefill_overlap": self.config.moe_prefill_overlap,
+            "cache_type": getattr(self.config, "cache_type", "radix"),
+            "model": {
+                "num_layers": mc.num_layers,
+                "hidden_size": mc.hidden_size,
+                "num_experts": getattr(mc, "num_experts", None),
+                "num_experts_per_tok": getattr(mc, "num_experts_per_tok", None),
+                "moe_intermediate_size": getattr(mc, "moe_intermediate_size", None),
+                "shared_expert_intermediate_size": getattr(mc, "shared_expert_intermediate_size", None),
+                "head_dim": getattr(mc, "head_dim", None),
+                "num_qo_heads": getattr(mc, "num_qo_heads", None),
+                "num_kv_heads": getattr(mc, "num_kv_heads", None),
+                "attention_groups": (
+                    [
+                        {
+                            "type": getattr(g, "type", getattr(g, "kind", None)),
+                            "layers": getattr(g, "layers", None),
+                        }
+                        for g in mc.attention_groups
+                    ]
+                    if getattr(mc, "attention_groups", None)
+                    else None
+                ),
+            },
+            "attention_backend_obj": type(self.attn_backend).__name__,
+            "moe_offload_cache": (
+                {
+                    "quant_format": self.moe_offload_cache.quant_format,
+                    "prefill_overlap": self.moe_offload_cache.prefill_overlap,
+                    "decode_target": getattr(self.moe_offload_cache, "decode_target", None),
+                    "num_experts": getattr(self.moe_offload_cache, "num_experts", None),
+                }
+                if self.moe_offload_cache is not None
+                else None
+            ),
+            "cpu_moe_executor": (
+                type(self.cpu_moe_executor).__name__
+                if self.cpu_moe_executor is not None
+                else None
+            ),
+            "linear_state_pool": (
+                {
+                    "num_slots": getattr(self.linear_state_pool, "num_slots", None),
+                    "state_shape": (
+                        list(self.linear_state_pool.recurrent_states[0].shape)
+                        if self.linear_state_pool is not None
+                        and len(self.linear_state_pool.recurrent_states) > 0
+                        else None
+                    ),
+                }
+                if self.linear_state_pool is not None
+                else None
+            ),
+            "cuda_graphs": {
+                "enabled": self.graph_runner is not None,
+                "cuda_graph_max_bs": self.config.cuda_graph_max_bs,
+                "note": "prefill is always eager (can_use_cuda_graph requires is_decode)",
+            },
+            "memory_mib": {
+                "allocated": round(torch.cuda.memory_allocated() / (1 << 20)),
+                "reserved": round(torch.cuda.memory_reserved() / (1 << 20)),
+            },
+        }
+        out_dir = os.environ.get(
+            "FREETOKEN_PROFILE_OUT", "artifacts/sm75-prefill/profile"
+        )
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, "backend-report.json")
+        with open(path, "w") as fh:
+            json.dump(report, fh, indent=2, default=str)
+        print(f"[profile] backend report -> {path}", flush=True)
+
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(
@@ -866,7 +965,9 @@ class Engine:
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
-                logits = self.model.forward()
+                from freetoken.profiling import maybe_profile_prefill
+
+                logits = maybe_profile_prefill(batch, self.model.forward)
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
