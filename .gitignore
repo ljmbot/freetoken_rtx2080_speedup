@@ -227,3 +227,8 @@ benchmarks/cross_framework
 
 # local e2e/bench artifacts (harnesses may run with repo cwd)
 /results/
+
+# --- freetoken-sm75-native-prefill project additions (Phase A) ---
+reference/FlashQLA-SM70-SM75/
+artifacts/sm75-prefill/traces/
+*.trace

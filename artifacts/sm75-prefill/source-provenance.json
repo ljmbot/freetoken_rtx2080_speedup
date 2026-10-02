@@ -1,0 +1,48 @@
+{
+  "generated_utc": "2026-10-02T01:44:37.376899+00:00",
+  "original_tree": "/home/lmeek/src/freetoken-sm75",
+  "original_git": {
+    "head": "35668da6db1e23111f1fbcc8a552455927a70f2a",
+    "head_subject": "fix(cuda): support Turing GPUs",
+    "branch": "(detached HEAD)",
+    "remote_origin": "https://github.com/FlashML-org/FreeToken.git",
+    "sm75_branch_sha": "35668da6db1e23111f1fbcc8a552455927a70f2a",
+    "sm75_branch_tip": "35668da fix(cuda): support Turing GPUs",
+    "sm75_equals_head": true
+  },
+  "new_project": "/home/lmeek/src/freetoken-sm75-native-prefill",
+  "new_project_base_sha": "35668da6db1e23111f1fbcc8a552455927a70f2a",
+  "clone_flags": "--no-local --no-hardlinks --no-checkout",
+  "origin_remote": "removed (no remotes in new clone)",
+  "transplant_note": "Original tree copied from another machine; venv is Python 3.12.3 but tree .so files are cpython-310 builds (must rebuild for 3.12); install is a non-editable site-packages copy.",
+  "copied_untracked_files": {
+    "qwen.sh": {
+      "sha256": "893fd43d4e4b52dfd6af85c8ce560a0e45e3d79aeaa93e2da3d65bfef3d5f291",
+      "bytes": 762
+    },
+    "profile.py": {
+      "sha256": "d5ab43608d1c705db1bc2b8c532269fcee84498b8624a40616587eaf3e8fb221",
+      "bytes": 405,
+      "note": "RELOCATED to reference/profile.py (byte-identical, same sha256). At the project root it shadowed the stdlib `profile` module: transformers->torch._dynamo->cProfile->`import profile` hit this stub, which calls run_one_prefill() at import time -> NameError, breaking every `python -c`/`-m`/interactive run from the root (the server is immune: console-script entry point, sys.path[0]=.venv/bin). Kept in reference/ as a Phase-C profiling placeholder."
+    },
+    "python/freetoken/requirements-old.txt": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    }
+  },
+  "mode_only_modified_tracked_files": [
+    "scripts/build-release-wheels.sh",
+    "scripts/ci/manylinux-build.sh",
+    "scripts/publish-wheels.sh"
+  ],
+  "intentional_exclusions": [
+    ".git",
+    ".venv (11 GB)",
+    "python/freetoken/.venv (5.5 GB nested transplant artifact)",
+    "caches",
+    "build outputs",
+    "compiled .so (rebuilt in new venv)",
+    "model weights (reused read-only from ~/Models)"
+  ],
+  "equivalence_note": "Source tree Python is byte-identical to the running site-packages copy (only .so ABI tags + untracked files differ). Reproduce = clone HEAD + copy 3 untracked files + rebuild 2 .so for 3.12 + editable install."
+}

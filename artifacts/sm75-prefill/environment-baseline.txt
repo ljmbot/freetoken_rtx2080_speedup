@@ -1,0 +1,44 @@
+# Phase A environment baseline (read-only capture)
+# captured_utc: 2026-10-02T01:51:12Z
+# host: ayeeye2  user: lmeek
+
+## GPU
+name, memory.total [MiB], memory.used [MiB], driver_version, compute_cap
+NVIDIA GeForce RTX 2080, 8192 MiB, 374 MiB, 595.91.07, 7.5
+
+## GPU full (nvidia-smi -q, trimmed)
+Driver Version                                         : 595.91.07
+CUDA Version                                           : 13.2
+    Product Name                                       : NVIDIA GeForce RTX 2080
+            PCIe Generation
+        Current Power Limit                            : 215.00 W
+        Requested Power Limit                          : 215.00 W
+        Default Power Limit                            : 215.00 W
+        Min Power Limit                                : 125.00 W
+        Max Power Limit                                : 240.00 W
+        Current Power Limit                            : N/A
+        Requested Power Limit                          : N/A
+        Default Power Limit                            : N/A
+        Min Power Limit                                : N/A
+        Max Power Limit                                : N/A
+    Max Clocks
+
+## GPU compute apps
+pid, process_name, used_gpu_memory [MiB]
+1790, /usr/libexec/gnome-remote-desktop-daemon, 114 MiB
+
+## Toolchain
+python3.12: Python 3.12.3  at /usr/bin/python3.12
+nvcc: Build cuda_13.0.r13.0/compiler.36424714_0
+gcc: gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+ninja:  (venv)
+
+## Memory / disk
+               total        used        free      shared  buff/cache   available
+Mem:            46Gi       3.6Gi        40Gi        28Mi       3.1Gi        43Gi
+Swap:          2.0Gi          0B       2.0Gi
+/dev/sda2       228G  102G  115G  47% /
+
+## New project venv
+Python 3.12.3
+venv python: /home/lmeek/src/freetoken-sm75-native-prefill/.venv/bin/python
