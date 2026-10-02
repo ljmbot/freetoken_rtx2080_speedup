@@ -163,6 +163,40 @@ FP16 transient (~53 MiB at M=2048) to fit the 8 GB card alongside E1's dense tem
 
 Full detail: `artifacts/sm75-prefill/e3-results.md`.
 
+## Phase G — End-to-end acceptance + final deliverables (COMPLETE, ACCEPTED)
+
+The final acceptance gate. Clean-restarted the candidate from scratch
+(`launch-candidate.sh` config, E1+E3, loopback:1920) and re-ran the full
+7-workload bench (5 reps + 1 warmup, identical flags to the Phase E A/B).
+**Reproducibility: every workload reproduced within ~0.5%** (prefill-2048
+5768→5739 ms; prefix-cached 1718→1713 ms with cached_tokens=1984 preserved;
+decode 32.8–33.5). Headline: **prefill-2048 38,979→5,739 ms (6.79×, 85% cut)**.
+
+- **Extended correctness sweep** (`scripts/sm75/g_sweep.py`, 31/31 pass,
+  `test-results/g-sweep.jsonl`): 24 sequential state-slot-reuse requests
+  (representative Hermes coding / structured-JSON / tool-call prompts — all 200,
+  non-empty, no NaN/Inf, server healthy after each); full prefix-cache hit
+  (1216 tok cached); **partial** prefix-cache hit (1792/1826 tok — the radix cache
+  stores completed prefill chunks, so the shared prefix must span ≥1 chunk);
+  continuation (shared prefix, different follow-ups); whole (723-tok) vs chunked
+  (1322-tok) prefill both correct; cancel-mid-stream + recovery; malformed-request
+  rejected + recovery.
+- **Non-SM75 dispatch gate** (`scripts/sm75/g_dispatch_gate.py`, 31/31 pass,
+  `test-results/g-dispatch-gate.log`): verified the dispatch decision logic across
+  the full (env-gate × GPU-capability) matrix — on SM80/86/89/90 and with either
+  gate off, the baseline Triton path always wins; the E1/E3 cuBLAS paths are taken
+  only when gate ON **and** cap < (8,0) (and, for E3, plain `*_and_mul` activation
+  with router weight on the gemm2 output). sm_89+ is never touched.
+- **Correctness edge matrix** (Phase E, re-confirmed): 91/91
+  (`test-results/e3-edge-matrix-results.md`).
+- **No NaN/Inf/CPU-fallback/crash** across the 42-row bench + 31-check sweep.
+- **Deliverables produced:** `docs/sm75-prefill.md`, `final-report.md`,
+  `environment-candidate.txt`, `build.log`, `summary.csv`,
+  `launch-candidate.sh`, `rollback.md`, `test-results/`, `traces/`.
+
+**All Phase G acceptance gates PASS → candidate ACCEPTED for SM75 (Turing).**
+Full detail: `artifacts/sm75-prefill/final-report.md`.
+
 ## Watch items / caveats
 
 - **`--max-prefill-length 2048`** caps prefill. The `prefill-4096` workload is **deferred** (will hit the cap / OOM on 8 GB). Baseline measured under the same cap for a fair A/B; 4096 to be added only if the cap is deliberately raised (logged) for both baseline and candidate.
@@ -173,15 +207,13 @@ Full detail: `artifacts/sm75-prefill/e3-results.md`.
 
 ## Next steps
 
-1. **Phase G — end-to-end acceptance + final deliverables.** 12 required deliverables;
-   the 7-workload A/B (baseline/E1/E3) is done. Remaining: `docs/sm75-prefill.md`,
-   `final-report.md`, `environment-candidate.txt`, `build.log`, `summary.csv`,
-   `launch-candidate.sh`, `rollback.md`, plus the clean-restart reproducibility re-run
-   and the 20+ sequential request / chunked-vs-whole / partial-cache-hit correctness
-   sweep.
+1. **Phase G — DONE, ACCEPTED** (see Phase G section above). All 12 deliverables
+   produced; clean-restart reproducibility re-run, 24-request sweep,
+   chunked-vs-whole, partial-cache-hit, non-SM75 dispatch gate, and
+   NaN/CPU-fallback/crash checks all pass.
 2. **Make E1+E3 the default on SM75** (flip `FREETOKEN_E1_CUBLAS` and
-   `FREETOKEN_E3_CUBLAS` to on-by-default for cap < (8,0)) once accepted — env-gated
-   today for a clean A/B.
+   `FREETOKEN_E3_CUBLAS` to on-by-default for cap < (8,0)) now that acceptance
+   passed — env-gated today for a clean A/B. (Post-acceptance step.)
 3. **E2 — DONE, dead end** (see Phase E2): no Triton config emits `mma` on SM75.
 4. **NVFP4 expert GEMM — DONE** (Phase E expert branch, E3): 136 ms/layer → 24 ms;
    the remaining prefill floor (~1.5–2 s: GDN, H2D offload, attention, routing) is

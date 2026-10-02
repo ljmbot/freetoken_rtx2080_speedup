@@ -1,0 +1,31 @@
+{"check": "seq-00-coding", "pass": true, "detail": "#0 coding status=200 len=242 out_tok=63 bad_token=False healthy=True"}
+{"check": "seq-01-json", "pass": true, "detail": "#1 json status=200 len=83 out_tok=56 bad_token=False healthy=True"}
+{"check": "seq-02-tool", "pass": true, "detail": "#2 tool status=200 len=84 out_tok=27 bad_token=False healthy=True"}
+{"check": "seq-03-coding", "pass": true, "detail": "#3 coding status=200 len=242 out_tok=63 bad_token=False healthy=True"}
+{"check": "seq-04-json", "pass": true, "detail": "#4 json status=200 len=83 out_tok=56 bad_token=False healthy=True"}
+{"check": "seq-05-tool", "pass": true, "detail": "#5 tool status=200 len=97 out_tok=30 bad_token=False healthy=True"}
+{"check": "seq-06-coding", "pass": true, "detail": "#6 coding status=200 len=242 out_tok=63 bad_token=False healthy=True"}
+{"check": "seq-07-json", "pass": true, "detail": "#7 json status=200 len=83 out_tok=56 bad_token=False healthy=True"}
+{"check": "seq-08-tool", "pass": true, "detail": "#8 tool status=200 len=84 out_tok=27 bad_token=False healthy=True"}
+{"check": "seq-09-coding", "pass": true, "detail": "#9 coding status=200 len=242 out_tok=63 bad_token=False healthy=True"}
+{"check": "seq-10-json", "pass": true, "detail": "#10 json status=200 len=83 out_tok=56 bad_token=False healthy=True"}
+{"check": "seq-11-tool", "pass": true, "detail": "#11 tool status=200 len=84 out_tok=27 bad_token=False healthy=True"}
+{"check": "seq-12-coding", "pass": true, "detail": "#12 coding status=200 len=242 out_tok=63 bad_token=False healthy=True"}
+{"check": "seq-13-json", "pass": true, "detail": "#13 json status=200 len=83 out_tok=56 bad_token=False healthy=True"}
+{"check": "seq-14-tool", "pass": true, "detail": "#14 tool status=200 len=84 out_tok=27 bad_token=False healthy=True"}
+{"check": "seq-15-coding", "pass": true, "detail": "#15 coding status=200 len=242 out_tok=63 bad_token=False healthy=True"}
+{"check": "seq-16-json", "pass": true, "detail": "#16 json status=200 len=83 out_tok=56 bad_token=False healthy=True"}
+{"check": "seq-17-tool", "pass": true, "detail": "#17 tool status=200 len=97 out_tok=30 bad_token=False healthy=True"}
+{"check": "seq-18-coding", "pass": true, "detail": "#18 coding status=200 len=242 out_tok=63 bad_token=False healthy=True"}
+{"check": "seq-19-json", "pass": true, "detail": "#19 json status=200 len=83 out_tok=56 bad_token=False healthy=True"}
+{"check": "seq-20-tool", "pass": true, "detail": "#20 tool status=200 len=84 out_tok=27 bad_token=False healthy=True"}
+{"check": "seq-21-coding", "pass": true, "detail": "#21 coding status=200 len=242 out_tok=63 bad_token=False healthy=True"}
+{"check": "seq-22-json", "pass": true, "detail": "#22 json status=200 len=83 out_tok=56 bad_token=False healthy=True"}
+{"check": "seq-23-tool", "pass": true, "detail": "#23 tool status=200 len=97 out_tok=30 bad_token=False healthy=True"}
+{"check": "cache-full-hit", "pass": true, "detail": "2nd cached_tokens=1216 (expect >1000) out2='391'"}
+{"check": "cache-partial-hit", "pass": true, "detail": "2nd cached_tokens=1792/1826 (expect >1000, < total) out2='4'"}
+{"check": "continuation", "pass": true, "detail": "contA='2 and 4' contB='yes'"}
+{"check": "prefill-whole", "pass": true, "detail": "whole in_tok=723 out='300'"}
+{"check": "prefill-chunked", "pass": true, "detail": "chunked in_tok=1322 out='42'"}
+{"check": "cancel+recovery", "pass": true, "detail": "started=True cancel_err=None recovery_out='OK.'"}
+{"check": "error-recovery", "pass": true, "detail": "malformed_rejected=True recovery_out='OK.'"}

@@ -1,0 +1,50 @@
+# build.log — FreeToken SM75 native-prefill candidate build identity
+
+Captured: 2026-10-02 (Phase G). The full install log is preserved at
+`setup-venv.log` (Phase A-6). This file records the build identity for
+reproducibility.
+
+## Build method
+- Independent clone: `git clone --no-local --no-hardlinks --no-checkout` of the
+  original at `35668da` (PR #24 "fix(cuda): support Turing GPUs"); `origin` removed.
+  See `source-provenance.json`.
+- Fresh venv: `.venv` (Python 3.12.3), pip/setuptools/wheel upgraded.
+- Deps: torch 2.11.0+cu130 + 88 pinned deps installed (Phase A-6, exit 0).
+- Editable install: `freetoken-0.1.2` (pip -e). `freetoken.__file__` resolves to
+  `~/src/freetoken-sm75-native-prefill/python/freetoken/__init__.py`.
+
+## Compiled extensions (rebuilt for Python 3.12 in the new venv)
+- `_cpu_moe.cpython-312`
+- `_pinned_tensor.cpython-312`
+Both import OK (Phase A-7/A-8).
+
+## Known build-time fix (Phase A, recorded for provenance)
+- The pip `ninja` package installed an empty (0-byte) binary on this platform
+  (`pip check`: "ninja is not supported on this platform"). The editable build
+  survived (torch BuildExtension fell back to make), but the server's runtime
+  kernel-cache build execs `ninja` directly -> `OSError: [Errno 8] Exec format
+  error`. Fix: `pip uninstall ninja`, then placed the known-good 370 KB ninja
+  1.13.2 (identical to the working original venv's) into `.venv/bin/ninja`.
+  `pip check` clean afterwards.
+
+## Identity
+- git sha (candidate): 87ab3fe1a2836615e199d6e04f2cf84f5fd39a28
+- git branch: perf/sm75-prefill
+- base sha: 35668da6db1e23111f1fbcc8a552455927a70f2a
+- freetoken pkg: 0.1.2 (editable)
+- torch: 2.11.0+cu130
+- cuda runtime (torch): 13.0
+- device: NVIDIA GeForce RTX 2080, cap (7,5)
+- driver: 595.91.07
+- model: /home/lmeek/Models/Qwen3.6-35B-A3B-NVFP4
+  (3 FTW shards, 20.89 GB; sha256s in model-metadata.json)
+
+## Phase E candidate code (the delta under test)
+- E1: `python/freetoken/kernel/triton/fp8_pertensor_linear.py`
+  (`_e1_dequant_cublas`, `_sm75_or_lower`, dispatch branch) — gated
+  `FREETOKEN_E1_CUBLAS=1` + `_sm75_or_lower()`.
+- E3: `python/freetoken/moe/fused_nvfp4_cublas.py` (new, self-contained) +
+  gate/dispatch in `python/freetoken/moe/fused_nvfp4.py` — gated
+  `FREETOKEN_E3_CUBLAS=1` + `_sm75_or_lower()` + plain `*_and_mul` activation +
+  router weight on gemm2 output. `FREETOKEN_E3_GROUP=16` bounds the FP16 transient.
+- No changes to the sm_89+ path or to decode (M==1).
