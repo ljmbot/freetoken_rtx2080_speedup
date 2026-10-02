@@ -110,6 +110,17 @@ not cached (per-forward temp ~50 MB) → **no VRAM growth**. Gated behind
 
 Full detail: `artifacts/sm75-prefill/e1-results.md`.
 
+## Phase E2 — Retune Triton GEMM for tensor cores (COMPLETE, dead end ruled out)
+
+Swept 75 Triton GEMM configs (BM∈{64,128} × BN∈{128,256} × BK∈{64,128} ×
+warps∈{4,8} × stages∈{2,3}, both with and without the in-kernel `tl.trans`) and
+counted tensor-core `mma`/`hmma` in each compiled PTX. **Every config emits
+`mma=0`** (2048–16384 scalar FP16 `fma`, 0 `hmma`). The `tl.dot` → CUDA-core FMA
+fallback is a **hard codegen limitation of Triton 3.6.0 on SM75, not a tuning
+issue** — no block/warp/stage/transpose combination produces tensor-core MMA.
+**E2 is a dead end; E1 (cuBLAS fp16) is the correct fix.** Script:
+`scripts/sm75/e2_ptx_sweep.py`; detail: `artifacts/sm75-prefill/e2-results.md`.
+
 ## Watch items / caveats
 
 - **`--max-prefill-length 2048`** caps prefill. The `prefill-4096` workload is **deferred** (will hit the cap / OOM on 8 GB). Baseline measured under the same cap for a fair A/B; 4096 to be added only if the cap is deliberately raised (logged) for both baseline and candidate.
@@ -121,7 +132,9 @@ Full detail: `artifacts/sm75-prefill/e1-results.md`.
 ## Next steps
 
 1. **Make E1 the default on SM75** (flip the `FREETOKEN_E1_CUBLAS` gate to on-by-default for cap < (8,0)) once this result is accepted — it is env-gated today for a clean A/B.
-2. **Optional E2:** fix the Triton GEMM to emit tensor-core `mma` on SM75 (block/warp/stage search or hand kernel) — memory-neutral, also benefits decode, but lower payoff than E1 (decode GEMV is already bandwidth-optimal).
+2. **E2 — DONE, dead end** (see Phase E2 above): no Triton config emits `mma` on
+   SM75; a hand HMMA kernel is the only other tensor-core path and offers no gain
+   over E1.
 3. **Optional:** attack the NVFP4 expert GEMM (17% of prefill) for a further cut below the ~2 s non-GEMM floor.
 4. Add `prefill-4096` only if `--max-prefill-length` is deliberately raised (logged) for both baseline and candidate.
 
