@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Dict, List, Literal
@@ -27,6 +28,13 @@ def _next_power_of_2(n: int) -> int:
     if n <= 1:
         return 1
     return 1 << math.ceil(math.log2(n))
+
+
+def _fi_backend() -> str:
+    """FlashInfer kernel backend. FA2 is the default: the FA3 kernels only build
+    for sm_90+, so FA2 is the only viable choice on consumer/sm75 cards. Set
+    FREETOKEN_FI_BACKEND=fa3 to opt into FA3 on datacenter GPUs."""
+    return os.getenv("FREETOKEN_FI_BACKEND", "fa2")
 
 
 logger = init_logger(__name__)
@@ -117,13 +125,13 @@ class FlashInferBackend(BaseAttnBackend):
         self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
             self.float_workspace_buffer,
             kv_layout="NHD",
-            backend="fa2",  # flashinfer fa3 is slow, use fa2 instead
+            backend=_fi_backend(),
         )
         self.decode_wrappers = BatchDecodeWithPagedKVCacheWrapper(
             self.float_workspace_buffer,
             use_tensor_cores=self.use_tensor_cores,
             kv_layout="NHD",
-            backend="fa2",  # flashinfer fa3 is slow, use fa2 instead
+            backend=_fi_backend(),
         )
 
         # NOTE: some hack to reuse the int_workspace_buffer
@@ -297,7 +305,7 @@ class FlashInferBackend(BaseAttnBackend):
             indices_buffer=capture.indices,
             last_page_len_buffer=capture.one_tensor[:bs],
         )
-        self.graph_wrappers[bs]._backend = "fa2"
+        self.graph_wrappers[bs]._backend = _fi_backend()
         self.graph_wrappers[bs]._int_workspace_buffer = self.int_workspace_buffer
         self.prepare_metadata(batch)
         metadata = batch.attn_metadata

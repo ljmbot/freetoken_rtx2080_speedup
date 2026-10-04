@@ -134,6 +134,7 @@ class Scheduler(SchedulerIOMixin):
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
         )
+        self._install_moe_stats_dump()
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
@@ -273,6 +274,67 @@ class Scheduler(SchedulerIOMixin):
 
         self._process_last_data(ongoing_data)
         self._flush_abort_acks()
+
+    def _install_moe_stats_dump(self) -> None:
+        """Trigger-file poller -> dump MoE cache study counters to FREETOKEN_MOE_STATS_FILE (JSON).
+
+        Off by default (no thread started unless --moe-collect-stats). A daemon thread polls for
+        the existence of <FREETOKEN_MOE_STATS_FILE>.trigger; when present it syncs the engine
+        stream, reads the on-device counters, writes the JSON, and removes the trigger. This
+        avoids the SIGUSR1 pitfall (the scheduler main thread is always blocked in a C call, so
+        a signal handler never runs). Best-effort: any failure only skips the dump, never the
+        request.
+        """
+        if not getattr(self.config, "moe_collect_stats", False):
+            return
+        import json
+        import os
+        import threading
+        import time
+
+        out_path = os.environ.get("FREETOKEN_MOE_STATS_FILE")
+        if not out_path:
+            return
+        trig = out_path + ".trigger"
+
+        def _dump() -> None:
+            try:
+                cache = self.engine.moe_offload_cache
+                if cache is None:
+                    return
+                torch.cuda.synchronize(self.device)
+                doc = {
+                    "cache_size": int(cache.cache_size),
+                    "num_layers": int(cache.num_layers),
+                    "num_experts": int(cache.num_experts),
+                    "miss": cache.decode_miss_stats(),
+                    "per_layer": cache.decode_miss_stats_per_layer(),
+                }
+                if getattr(cache, "collect_decode_freq", False):
+                    try:
+                        doc["routing"] = cache.decode_routing_stats()
+                        # Full per-layer routing histogram (40 x 256) so the oracle-hit
+                        # curve can be recomputed at any cache size offline.
+                        doc["decode_freq"] = cache.decode_freq.cpu().tolist()
+                    except Exception:
+                        pass
+                with open(out_path, "w") as f:
+                    json.dump(doc, f, indent=2)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"moe stats dump failed: {e!r}")
+
+        def _poll() -> None:
+            while True:
+                if os.path.exists(trig):
+                    try:
+                        os.unlink(trig)
+                    except OSError:
+                        pass
+                    _dump()
+                time.sleep(0.2)
+
+        threading.Thread(target=_poll, daemon=True, name="moe-stats-poll").start()
+        logger.info(f"MoE cache-study dump armed: touch {trig} to write {out_path}")
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:

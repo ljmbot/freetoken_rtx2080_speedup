@@ -22,7 +22,13 @@ from freetoken.kernel.fla.utils import (
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
 GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
-GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
+# num_warps 4 -> 8 is sm75-tuned (idea-4): 4 warps is ~4.1x slower than 8 on sm75 at
+# T=8192 (54.8 -> 13.3 ms/call, see scripts/sm75/gdn_microbench.py). Opt-in via
+# FREETOKEN_GDN_SM75_TUNE=1 (default 0 = original num_warps=4, Ampere/Hopper
+# byte-identical to before); BV=32 and num_stages=2 are already the sm75 winners and
+# are unchanged. SGLANG_GDN_CHUNK_H_NUM_WARPS still forces the value directly.
+_GDN_SM75_TUNE = os.getenv("FREETOKEN_GDN_SM75_TUNE", "0") == "1"
+GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "8" if _GDN_SM75_TUNE else "4"))
 GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
 
 

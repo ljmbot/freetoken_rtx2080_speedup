@@ -236,3 +236,7 @@ artifacts/sm75-prefill/traces/
 # keep only the small per-op tables + backend report + driver log.
 artifacts/sm75-prefill/profile/prefill-*.json
 artifacts/sm75-prefill/serve-profile.log
+# 8192-token profile traces (~58 MB each, reproducible via profile_driver_8192.py):
+# keep the small .table.json + backend-report.json, ignore the raw traces.
+artifacts/sm75-prefill/profile-8192/prefill-*.json
+artifacts/sm75-prefill/profile-8192-gdn/prefill-*.json

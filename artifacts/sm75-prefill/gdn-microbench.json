@@ -1,0 +1,172 @@
+{
+  "o_varlen": [
+    {
+      "BV": 32,
+      "BK": 64,
+      "num_warps": 4,
+      "num_stages": 2,
+      "ms": 49.26
+    },
+    {
+      "BV": 32,
+      "BK": 64,
+      "num_warps": 4,
+      "num_stages": 3,
+      "ms": 48.748
+    },
+    {
+      "BV": 32,
+      "BK": 64,
+      "num_warps": 8,
+      "num_stages": 2,
+      "ms": 33.798
+    },
+    {
+      "BV": 32,
+      "BK": 64,
+      "num_warps": 8,
+      "num_stages": 3,
+      "ms": 33.812
+    },
+    {
+      "BV": 32,
+      "BK": 128,
+      "num_warps": 4,
+      "num_stages": 2,
+      "ms": 143.381
+    },
+    {
+      "BV": 32,
+      "BK": 128,
+      "num_warps": 4,
+      "num_stages": 3,
+      "ms": 143.379
+    },
+    {
+      "BV": 32,
+      "BK": 128,
+      "num_warps": 8,
+      "num_stages": 2,
+      "ms": 138.747
+    },
+    {
+      "BV": 32,
+      "BK": 128,
+      "num_warps": 8,
+      "num_stages": 3,
+      "ms": 138.703
+    },
+    {
+      "BV": 64,
+      "BK": 64,
+      "num_warps": 4,
+      "num_stages": 2,
+      "ms": 94.236
+    },
+    {
+      "BV": 64,
+      "BK": 64,
+      "num_warps": 4,
+      "num_stages": 3,
+      "ms": 94.477
+    },
+    {
+      "BV": 64,
+      "BK": 64,
+      "num_warps": 8,
+      "num_stages": 2,
+      "ms": 31.754
+    },
+    {
+      "BV": 64,
+      "BK": 64,
+      "num_warps": 8,
+      "num_stages": 3,
+      "ms": 32.033
+    },
+    {
+      "BV": 64,
+      "BK": 128,
+      "num_warps": 4,
+      "num_stages": 2,
+      "ms": 147.477
+    },
+    {
+      "BV": 64,
+      "BK": 128,
+      "num_warps": 4,
+      "num_stages": 3,
+      "ms": 147.594
+    },
+    {
+      "BV": 64,
+      "BK": 128,
+      "num_warps": 8,
+      "num_stages": 2,
+      "ms": 105.462
+    },
+    {
+      "BV": 64,
+      "BK": 128,
+      "num_warps": 8,
+      "num_stages": 3,
+      "ms": 105.479
+    }
+  ],
+  "h": [
+    {
+      "ms": 54.755,
+      "BV": 32,
+      "num_warps": 4,
+      "num_stages": 2
+    },
+    {
+      "ms": 54.758,
+      "BV": 32,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    {
+      "ms": 13.3,
+      "BV": 32,
+      "num_warps": 8,
+      "num_stages": 2
+    },
+    {
+      "ms": 13.399,
+      "BV": 32,
+      "num_warps": 8,
+      "num_stages": 3
+    },
+    {
+      "ms": 70.833,
+      "BV": 64,
+      "num_warps": 4,
+      "num_stages": 2
+    },
+    {
+      "ms": 70.93,
+      "BV": 64,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    {
+      "ms": 14.003,
+      "BV": 64,
+      "num_warps": 8,
+      "num_stages": 2
+    },
+    {
+      "ms": 13.948,
+      "BV": 64,
+      "num_warps": 8,
+      "num_stages": 3
+    }
+  ],
+  "combined": {
+    "current_ms": 202.232,
+    "best_ms": 45.054,
+    "speedup": 4.489,
+    "proj_save_n8192_ms": 4835.6
+  }
+}

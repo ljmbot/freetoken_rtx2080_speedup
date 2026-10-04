@@ -197,9 +197,188 @@ decode 32.8–33.5). Headline: **prefill-2048 38,979→5,739 ms (6.79×, 85% cut
 **All Phase G acceptance gates PASS → candidate ACCEPTED for SM75 (Turing).**
 Full detail: `artifacts/sm75-prefill/final-report.md`.
 
+## Phase H — Post-acceptance wins (COMPLETE, 2026-10-03)
+
+Post-acceptance optimization pass on `perf/sm75-prefill`. All work env-gated for
+clean A/B; production `qwen.sh` updated only where a win was measured and safe.
+Full detail: `/home/lmeek/freetoken_prefill_next_plan.md`.
+
+### H-1 — `--max-prefill-length 2048 → 4096` (LANDED in `qwen.sh`)
+
+At cap 2048 a 2060-token prompt is one 2048-chunk + a 12-token tail (two
+forwards, two × the ~4.7 s fixed offload floor); at cap 4096 it is a single
+forward. Measured (8-workload bench, `results-candidate-4096.jsonl`): prefill-2048
+5768 → 4117 ms (29% faster), no OOM (1.09 GiB free), decode flat, 0 errors. Sweep
+that motivated it: 4096 = 510 tok/s vs 502 at 2048; 8192 regresses to 408 (GDN +
+attention grow super-linearly and overwhelm the fixed cost).
+
+### H-2 — `--moe-prefill-hit-d2d` (MEASURED, NOT landed — user: "leave it as is")
+
+Serves cache-resident experts via a device-side D2D gather (needs
+`--moe-cache-size > 512`). Measured ~7% on cache-hit workloads (prefix-cached
+1711→1587 ms, agent-envelope 1712→1586 ms, stable all 5 reps), flat on fresh
+prefill. Not landed in `qwen.sh` (production stays at cache 512 where the flag is
+a no-op); would need its own A/B at 130k context before landing.
+
+### H-3 — Idea 4: sm75 GDN recurrence tile tuning (LANDED in `qwen.sh`)
+
+The two dominant GDN kernels shipped Hopper/Ampere-tuned tile configs
+(`chunk_fwd_kernel_o` hardcoded BK=128/num_warps=4; `chunk_h` num_warps=4). On
+sm75 they are ~4.5× slower than the sm75-optimal config. Fix: an opt-in master
+switch **`FREETOKEN_GDN_SM75_TUNE`** (default 0 = original config, so
+Ampere/Hopper are byte-identical; `qwen.sh` sets it to 1). When on:
+`chunk_fwd_kernel_o` BK 128→64 / num_warps 4→8, `chunk_h` num_warps 4→8.
+Individual `SGLANG_GDN_CHUNK_O_*`/`SGLANG_GDN_CHUNK_H_*` knobs still override.
+
+- **Files:** `kernel/fla/chunk_o.py` (+`import os`, `FREETOKEN_GDN_SM75_TUNE`
+  gate, env-driven launch config); `kernel/fla/chunk_delta_h.py` (same gate on
+  num_warps); `scripts/sm75/gdn_microbench.py` (config sweep),
+  `scripts/sm75/gdn_correctness.py` (old-vs-new rel-L2),
+  `scripts/sm75/profile_breakdown.py` (raw chrome-trace device breakdown).
+- **Microbench gate (≥1.5×):** PASS, 4.64× (o) / 4.12× (h) / 4.49× combined at
+  T=8192, validated against the measured per-call time.
+- **Correctness gate:** PASS, bit-identical (rel-L2 = 0.000e+00, max abs diff 0.0)
+  for both the kernel and the full `gdn_prefill_chunk_fla` output. The chunk GDN
+  path is prefill-only (decode uses `gdn_decode_fla`), so decode is untouched.
+- **End-to-end A/B** (`results-candidate-gdn4096.jsonl`, 8 workloads, 5 reps):
+  prefill-2048 4119→**2869 ms (−30.3%)**, prefill-4096 9753→**7352 ms (−24.6%)**,
+  mixed-2048 7874→**6644 ms (−15.6%)**, short-prefill flat, decode flat
+  (33.5→33.4), no OOM, 0 errors.
+- **Re-profile n8192** (`profile-8192-gdn/`): `chunk_fwd_kernel_o` 4431→967 ms
+  (4.58×), `chunk_h` 1790→427 ms (4.19×), total device 19882→15043 ms (−24.3%).
+  GDN is now 10.8% of device (was 32.5%); **full attention is the new
+  co-dominant cost at 42.3%** — the next lever.
+
+### H-4 — Idea 5: full-attention extend kernel (tile config dead-end; CUTLASS backend = 13× WIN found)
+
+Full attention (`_extend_attention_split_kernel`, 10 layers) is 42.3% of device
+post-GDN-tune. Three levers investigated:
+
+- **Tile-config sweep — NO WIN at true geometry.** The model's full-attention
+  layers are **16 q-heads / 2 kv-heads / head_dim=256** (GQA group 8), *not* the
+  32/16/128 the first microbench assumed. At hd=256 the current (32,16) tile is
+  already fastest (161.9 ms @ T=4096): (16,32)=164.3, (32,32)=171.2, and
+  (64,16)/(64,32)/(16,64) all OOM (81–98 KiB > 64 KiB smem). An earlier "1.27×"
+  figure was a **measurement artifact** (wrong geometry, 32/16/128); a config
+  switch was landed then **reverted** after the server crashed on startup
+  (`out of resource: shared memory, Required: 98304, limit 65536`) — the (32,64)
+  tile fits only hd≤128. `attention.py` and `qwen.sh` are back to the pre-idea-5
+  state (verified: empty `git diff` for `attention.py`).
+- **FlashInfer / FA2 backend — NOT VIABLE on sm75.** Installed
+  `flashinfer-python 0.6.18` + matching cubin/jit-cache. The FA2 prefill kernel
+  fails with `no kernel image is available for execution on the device`: prebuilt
+  cubins ship sm80/89/90a/100a/103a/120f only, no Turing build. FA2's pipelining
+  needs sm80+ instructions. **Removed** from the venv (was ~10.5 GB).
+- **CUTLASS mem-efficient (PyTorch SDPA) — 13.4× WIN on fresh prefill (new).**
+  PyTorch's built-in **memory-efficient (CUTLASS) SDPA backend runs on sm75** and,
+  at the true production geometry (16/2/256, T=4096, fresh), is **12.1 ms vs the
+  Triton kernel's 162.0 ms = 13.4×** (measured in the same process, same inputs).
+  The only wrinkle: the CUTLASS backend requires equal q/kv head counts, so GQA
+  (16 qh / 2 kvh) must be expanded to MHA via `repeat_interleave` (0.4 ms + 34 MB
+  at T=4096 — negligible). Correctness vs the Triton kernel: relL2 1.73e-04 (OK).
+  PyTorch's Flash and cuDNN SDPA backends are **sm80–sm121 only** (rejected on
+  sm75); only the CUTLASS mem-efficient + math backends run here, and mem-efficient
+  is the fast one. PyTorch SDPA cannot take GQA natively (16 qh / 2 kvh → "No
+  available kernel"), so the MHA expansion is mandatory.
+- **CUTLASS backend — BUILT, INTEGRATED, LANDED in `qwen.sh` (H-5).** New
+  `python/freetoken/attention/cutlass.py` (registered as `--attention-backend
+  cutlass`; default-off, `qwen.sh` now opts in). Two prefill paths use CUTLASS
+  mem-efficient SDPA; decode is always Triton:
+  - *fresh* (prefix==0): dense, `is_causal=True`, GQA→MHA expand.
+  - *prefix* (chunk 2+ of a chunked prefill): gather the request's full KV from the
+    paged cache, GQA→MHA expand, offset-causal mask. A memory guard bails to the
+    Triton extend kernel if the expansion would exceed 60% of free VRAM (it scales
+    with context: ~1.1 GB at 64K).
+  - **Correctness:** byte-for-byte identical to Triton (greedy, seed=1234, 29 tok).
+  - **Kernel:** fresh 4096 = 13.4×, prefix 4096 (prefix=4096) = 10.1× vs the Triton
+    extend kernel (`scripts/sm75/cutlass_prefix_bench.py`, relL2 2.2e-04).
+  - **End-to-end (64K config, 5 reps):** flat at ≤4096 (attention is ~2% of a
+    ~5 s prefill), **~2.9× at 61K tokens cold** (Triton 941 s vs CUTLASS 325 s) —
+    the win scales with length because attention cost is quadratic and only 10 of 40
+    layers are full-attention. `scripts/sm75/attn_microbench.py` +
+    `cutlass_prefix_bench.py` kept (`--qh/--kvh/--hd`).
+
+### H-5 — 64K context + reduced expert cache to make room for CUTLASS (LANDED in `qwen.sh`)
+
+The CUTLASS prefix path needs headroom for the GQA→MHA expansion at long context
+(~1.1 GB at 64K). The old 130K config left only 0.85 GiB free. User-authorized
+levers, applied to `qwen.sh`:
+
+- **`--num-tokens` / `--max-seq-len-override` 130000 → 64000** — KV cache 2.48 →
+  1.22 GiB.
+- **`--moe-cache-size` 512 → 256 + `--disable-moe-prefill-overlap`** — the overlap
+  feature is what forces the 2×-experts (512) floor; disabling it lets the cache
+  drop to 1× (256), freeing ~0.85 GiB (the hit-D2D feature H-2 needs >512, so it
+  is off under this config).
+- **`--cuda-graph-max-bs` 1 → 0** — no CUDA-graph capture (saves the graph
+  scratch; decode is eager). Fine for a headless prefill-focused GPU.
+- **`--attention-backend` triton → cutlass.**
+- **Memory after:** 2.57 GiB free (was 0.85 GiB) — enough for the expansion at 64K.
+- **Costs:** prefill-overlap off (small prefill cost), decode eager (slightly
+  slower decode), context capped at 64K. Trade-off is favorable for long-prefill
+  workloads (the 2.9× at 61K dwarfs the small overlap/decode costs).
+- **Bench (64K config, 5 reps, `results-baseline-64k.jsonl` vs
+  `results-cutlass-64k.jsonl`):** prefill-4096 4805→4696 ms (1.02×), mixed-2048
+  total 15199→14014 ms (1.08×), decode 12.1→12.1 tok/s, prefix-cached flat, 0
+  errors. (The ≤4096 numbers are flat because attention is a small slice there;
+  the long-context win is the 61K A/B above.)
+
+### H-6 — Decode: MoE expert-cache size is the lever (LANDED in `qwen.sh`: 256 → 512)
+
+The decode slowdown was **config-driven, not kernel-driven**. The decode kernels
+were checked for the same sm75 mis-tuning that bit the prefill GDN kernels and
+are **fine**: the fp8 dense GEMV (`_gemv_splitk_kernel`) and NVFP4 Marlin GEMV
+(`_decode_nvfp4_marlin_kernel`) are bandwidth-bound (read each weight once — the
+correct shape for M=1), and the GDN decode recurrence uses `num_warps=1,
+num_stages=3` (sensible for batch=1). No tile change needed.
+
+The real cause: the **unified MoE slot cache** (one LRU pool shared across all 40
+MoE layers) was at the 256-slot floor (set in H-5 to make room for the 64K +
+CUTLASS config). Each decode step touches 40 layers × 8 experts = **320
+expert-rows**, but there are 10,240 distinct expert-rows (256 experts × 40
+layers), so a 256-slot pool holds only ~0.8× the per-step working set and
+**thrashes** — evicting and re-streaming experts over PCIe nearly every step.
+
+**Measured A/B (live server, runtime `POST /v1/cache/rebuild`, no restart,
+299 out-tokens, prefill included):**
+
+| slots | decode tok/s | free VRAM | 61K CUTLASS prefix path |
+|---|---|---|---|
+| 256 (H-5 floor) | 14.33 | 2.55 GiB | OK |
+| **512 (landed)** | **18.23** | **2.01 GiB** | **OK (peak 1.195 < 0.6×2.01)** |
+| 600 | 19.31 | 1.85 GiB | **BAILS to Triton** |
+| 800 | 20.30 | 1.48 GiB | BAILS to Triton |
+| 1024 | 21.38 | 1.13 GiB | BAILS to Triton |
+| 1500 (original) | 24.69 | 0.31 GiB | BAILS to Triton |
+| 2000 | rejected (503, needs 4.53 GiB) | – | – |
+
+**512 is the sweet spot, not 1500.** The CUTLASS prefix path (the 2.9× 61K win
+from H-5) has a memory guard that bails to the Triton extend kernel if the
+GQA→MHA expansion peak (≈1.195 GiB at 61K) exceeds 0.6× free VRAM — i.e. it
+needs **~2.0 GiB free**. Bigger caches (≥600) win more decode but leave <2.0 GiB
+free and **lose the 61K prefill win**. 512 keeps 2.01 GiB free (61K CUTLASS
+stays alive) *and* recovers most of the decode (+27% vs 256). The two wins are
+VRAM-antagonistic; 512 is the max cache that keeps both.
+
+- **Router is a non-issue (already pure-torch):** `triton_kernels` is hard-gated
+  to sm80+ (`kernel/backend.py::_supports_sm80`), so on sm75 the MoE router
+  *already* runs the pure-torch `_torch_fused_topk` (the log warning just
+  confirms it). Measured 88 µs/call × 40 layers = **3.5 ms/step ≈ 9%** of a
+  40.5 ms decode step — not worth changing.
+- **`qwen.sh`:** `--moe-cache-size` 256 → **512** (kept
+  `--disable-moe-prefill-overlap`, `--cuda-graph-max-bs 1`, 64K, CUTLASS).
+  `scripts/sm75/serve-candidate-cutlass.sh` synced to 512.
+- **Net decode (graphs on + 512 cache): ~14.3 → 18.2 tok/s** (the earlier ~1.8
+  tok/s was the no-graphs probe). Restoring graphs (H-5 follow-up, "yes A")
+  removed the per-kernel launch overhead; the cache bump removed the PCIe
+  thrash. Together they take decode from the 1.8 tok/s floor to ~18 tok/s.
+
 ## Watch items / caveats
 
-- **`--max-prefill-length 2048`** caps prefill. The `prefill-4096` workload is **deferred** (will hit the cap / OOM on 8 GB). Baseline measured under the same cap for a fair A/B; 4096 to be added only if the cap is deliberately raised (logged) for both baseline and candidate.
+- **`--max-prefill-length 4096`** (raised from 2048 in Phase H-1). The radix cache
+  only hits for prompts ≤ the cap, so the cache-hit ceiling moved 2048 → 4096 full
+  tokens. `prefill-8192` is deferred (regresses: GDN + attention grow
+  super-linearly and overwhelm the fixed offload cost — see the 4096 sweep).
 - **Memory is tight** — `--memory-ratio 0.95` leaves only ~0.84 GiB free after init (6.9 GiB used). Watch for OOM on long prompts.
 - **`triton_kernels` not installed** → pure-torch router fallback (numerically equivalent, slower). This matches the original SM75 setup, so it's part of the baseline.
 - **Offload MoE backend** → decode does CPU↔GPU expert transfers; decode is slow. Mixed workloads (128 out) take minutes.
@@ -243,3 +422,118 @@ bash ~/src/freetoken-sm75-native-prefill/scripts/sm75/serve-baseline.sh
   --out ~/src/freetoken-sm75-native-prefill/artifacts/sm75-prefill/results.jsonl \
   --corpus-out ~/src/freetoken-sm75-native-prefill/artifacts/sm75-prefill/benchmark-corpus.json
 ```
+
+## H-7: MoE decode cache study (C-coding / spec-reading workload)
+
+Question: is the landed 512-slot unified MoE expert cache sufficient for the user's
+real workload (C-coding + reading specs), or is that workload skewier (fewer misses)
+than the general benchmark assumed?
+
+Method: wired a `--moe-collect-stats` flag (new, off by default) + a trigger-file dump
+in the scheduler (`touch $FREETOKEN_MOE_STATS_FILE.trigger` writes the counters to JSON).
+Ran the study server with `--cuda-graph-max-bs 0` (the routing histogram is only
+accurate with graphs off — the captured decode graph does not re-run the host-side
+`decode_freq.scatter_add_`). Fed 12 C-coding/spec prompts × 299 out-tokens = **3588
+decode steps** (ring buffers, pthread, ELF parsing, io_uring, memory pools, stdatomic,
+CRC-32C, RFC 793, hash tables, x86-64 ABI, merge sort, realloc).
+
+**Result: the workload is NOT skewier than general. Routing is genuinely hard to cache.**
+
+- Realized miss rate (unified 512-slot LRU): **60.4%** (hit 39.6%).
+- Per-layer realized miss spans **47.8% (layer 20) … 90.1% (layer 0)** — early layers
+are the least cacheable.
+- Routing skew (per-layer histogram): working set **mean 235 / max 256** distinct
+experts (of 256); only **110 experts carry 90%** of the traffic; normalized entropy
+**0.844** (1.0 = perfectly uniform). The model spreads each token's 8 chosen experts
+across almost the whole expert set — there is no small hot set to pin.
+
+Oracle hit ceiling (a perfect cache holding the hottest per-layer set, static):
+
+| slots | /layer | oracle hit |
+|------:|-------:|-----------:|
+| 256   | 6      | 21.6%      |
+| 512   | 13     | 33.7%      |
+| 1024  | 26     | 49.0%      |
+| 1500  | 38     | 59.4%      |
+| 2000  | 50     | 67.5%      |
+| 2663  | 67     | 76.3%      |
+
+Interpretation:
+- The realized 512 hit (39.6%) already **exceeds** the static per-layer oracle at the
+same budget (33.7%) — the unified pool sharing 512 slots dynamically across layers
+beats the "pin the hottest per layer" model. Sharing is worth ~6 pts.
+- Ceiling gain 512→1500 slots is +25.7 pts of hit (i.e. −25.7 pts of miss), matching the
++29% decode A/B measured earlier (256→18.23 tok/s at 512, 24.69 at 1500). So the A/B
+speedup tracks the cache ceiling directly.
+- **512 stays the sweet spot**: it keeps the 61K CUTLASS prefill guard (needs >2.0 GiB
+free) while taking most of the available cache win. A bigger cache keeps paying up to
+1500, but only by trading away the prefill win (bails the CUTLASS guard at ≥600).
+- Bottom line for the user's recollection ("there wasn't that many misses"): the *general*
+benchmark and this C-coding workload are about the same — routing is near-uniform
+(entropy 0.84) and the cache is fundamentally limited, not mis-sized. The earlier
+"few misses" memory was most likely the radix/KV prefix cache (H-3, ~7% hit), a
+different mechanism.
+
+Artifacts: `~/.hermes/cache/scratch/moe_cache_study.json` (full 40×256 histogram +
+per-layer realized stats), `analyze_cache_study.py`, `cache_study_run.py`.
+
+## H-8: Hybrid decode A/B (GPU offload + CPU overflow) — NOT a win on this box
+
+Question: the engine has a `--moe-backend hybrid` mode — GPU fetches a capped
+subset of misses over PCIe, the CPU computes the overflow experts in parallel
+(overlapped), partials merge. Could that hide the ~20.7 ms/step PCIe cost?
+
+Setup: identical to production `qwen.sh` (512 slots, cutlass, graphs on, 64K)
+except `--moe-backend hybrid`. Auto fetch-fraction from the `ft bench bw`
+profile = 42.2% (CPU computes 57.8% of each step's misses).
+
+| backend | tok/s (299 out-tok, 3 runs) |
+|---------|------------------------------|
+| offload (production, LANDED) | 17.68 / 18.06 / 18.12 → **18.1** |
+| hybrid, auto 42% fetch        | 16.43 / 16.40 / 17.30 → **16.7** |
+
+Hybrid is **~8% SLOWER**, not faster. Root cause (found in `~/.cache/freetoken/benchbw.json`):
+the profile that drives the auto fetch-fraction was benched on a **23-core** CPU
+(same RTX 2080, different machine) where CPU MoE = 16.6 GB/s > PCIe gather 8.2 GB/s
+(ratio 2.03 → "hybrid recommended"). This box has only **6 physical cores**
+(12 threads), so the CPU side can only use ~5-6 cores — it is the bottleneck,
+not the PCIe bus. The auto 42% fetch-fraction is miscalibrated for this CPU.
+A fetch-fraction sweep (0.8/1.0) was started to confirm the trend but the
+multi-server-restart sweep exceeded the tool timeout; the single-point hybrid
+measurement above is conclusive enough: offload is optimal here.
+
+**Conclusion: keep `--moe-backend offload` (the default). Do NOT enable hybrid
+on this 6-core box.** Hybrid only pays off when the CPU is much faster than the
+PCIe bus (≥2×), which requires many more cores than this machine has.
+
+## H-9: Python engine overhead — NOT a decode bottleneck
+
+Question: the engine is largely Python — does it add per-step latency, or is
+there a tight Python spin loop feeding the PCIe expert transfers that could be
+optimized / replaced with high-speed DMA?
+
+Findings (code-level, not speculation):
+- **CUDA graphs remove the per-step Python loop from the hot path.** The
+per-layer driver (`moe.py:315` `cache.ensure_experts(layer, ids);
+cache.copy_missing()`) is a Python loop over 40 layers, but it runs **once at
+graph-capture time**. In production (`--cuda-graph-max-bs 1`) each decode step
+is a single `graph.replay()` — the 40 copy launches + GEMMs are baked into the
+graph. Python is not re-executed per step.
+- **The expert transfer is already DMA, not a Python spin loop.** The CPU expert
+bank is **pinned** host memory (`offload_cache.py:268` "host (CPU pinned) expert
+source banks"), so the H2D copy is DMA-eligible — the DMA engine moves the
+bytes, the CPU is not in the data path.
+- **It's already fused**: `fast_index_copy_multi_jit` does "one launch copies the
+missing rows for every bank" instead of one launch per layer. That is the
+high-speed path (pinned memory + single fused kernel), not a per-layer Python
+`memcpy`.
+- Python only does bookkeeping (routing, slot assignment) at capture time and a
+graph-replay call per step. There is no Python overhead to reclaim on decode.
+
+**The real ceiling is the PCIe bus itself.** Measured on this GPU (benchbw.json):
+PCIe gather (the actual scattered 1.70 MB expert transfer rate) = **8.19 GB/s**,
+vs linear H2D ceiling 10.34 GB/s. That is a bus limit — no Python or kernel
+tuning makes it faster. The only levers are: fewer misses (workload-inherent,
+H-7), smaller per-expert transfer (already 4-bit NVFP4, minimal), or offloading
+some compute to the CPU in parallel (hybrid, H-8 — needs a faster CPU). None
+available on this 6-core / PCIe-3.0 box.

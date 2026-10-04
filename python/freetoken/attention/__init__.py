@@ -97,6 +97,19 @@ def create_triton_backend(config: ModelConfig):
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
+    "cutlass",
+    BackendInfo(
+        supported_types=frozenset({AttnType.FULL, AttnType.SWA}),
+        consumes_attn_spec=True,
+    ),
+)
+def create_cutlass_backend(config: ModelConfig):
+    from .cutlass import CutlassAttentionBackend
+
+    return CutlassAttentionBackend(config)
+
+
+@SUPPORTED_ATTENTION_BACKENDS.register(
     "dsv4_sparse",
     BackendInfo(supported_types=frozenset({AttnType.DSV4})),
 )

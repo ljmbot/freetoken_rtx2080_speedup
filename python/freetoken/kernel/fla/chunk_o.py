@@ -4,6 +4,7 @@
 
 from typing import Optional
 
+import os
 import torch
 import triton
 import triton.language as tl
@@ -14,6 +15,18 @@ from freetoken.kernel.fla.utils import check_shared_mem, is_nvidia_hopper
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
+
+# sm75 (RTX 2080) tile tuning, idea-4. The original BK=128/num_warps=4 below is
+# Hopper/Ampere-tuned and ~4.6x slower than BK=64/num_warps=8 on sm75 (measured
+# 147.5 -> 31.8 ms/call at T=8192, see scripts/sm75/gdn_microbench.py).
+# Opt-in via FREETOKEN_GDN_SM75_TUNE=1 (default 0 = original Hopper/Ampere config,
+# so Ampere/Hopper deployments are byte-identical to before). Individual knobs can
+# still be forced directly via SGLANG_GDN_CHUNK_O_* (they take precedence).
+_GDN_SM75_TUNE = os.getenv("FREETOKEN_GDN_SM75_TUNE", "0") == "1"
+GDN_CHUNK_O_BK = int(os.getenv("SGLANG_GDN_CHUNK_O_BK", "64" if _GDN_SM75_TUNE else "128"))
+GDN_CHUNK_O_BV = int(os.getenv("SGLANG_GDN_CHUNK_O_BV", "64"))
+GDN_CHUNK_O_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_O_NUM_WARPS", "8" if _GDN_SM75_TUNE else "4"))
+GDN_CHUNK_O_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_O_NUM_STAGES", "2"))
 
 
 # @triton.autotune(
@@ -164,11 +177,11 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
-        BK=128,
-        BV=64,
+        BK=GDN_CHUNK_O_BK,
+        BV=GDN_CHUNK_O_BV,
         USE_G=g is not None,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=2,
+        num_warps=GDN_CHUNK_O_NUM_WARPS,
+        num_stages=GDN_CHUNK_O_NUM_STAGES,
     )
     return o

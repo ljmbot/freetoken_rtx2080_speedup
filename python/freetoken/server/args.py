@@ -513,6 +513,16 @@ def parse_args(
         choices=["lru"],
         help="The unified MoE cache eviction policy.",
     )
+    parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Capture decode MoE cache miss-rate + routing-skew counters for cache "
+            "studies. Slight overhead; off by default. Read the accumulated counters "
+            "with SIGUSR1 to the scheduler process (dumps to FREETOKEN_MOE_STATS_FILE)."
+        ),
+    )
 
     parser.add_argument(
         "--moe-cpu-threads",
