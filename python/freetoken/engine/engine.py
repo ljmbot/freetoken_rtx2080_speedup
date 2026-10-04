@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import math
 import os
+import time
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -335,6 +336,13 @@ class Engine:
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
+
+        # ======================= MTP (nextn) head (optional, --mtp) ========================
+        # Loaded before KV sizing so its ~0.53 GB is subtracted from the KV budget.
+        # Default-off: mtp_head stays None and nothing below runs (byte-for-byte no-op).
+        self.mtp_head = None
+        if config.mtp:
+            self._init_mtp_head(config)
 
         # ======================= KV cache initialization ========================
         new_free = self._sync_get_memory()[1]
@@ -691,6 +699,36 @@ class Engine:
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
         return cache
+
+    def _init_mtp_head(self, config: EngineConfig) -> None:
+        """Build + load the Qwen3.5 nextn (MTP) head. Called only when --mtp is set.
+
+        Loads the 19 ``mtp.*`` tensors from a safetensors file (default
+        <model-path>/mtp_head.safetensors), quantizes the 256 routed experts
+        bf16 -> nvfp4 (GPU-resident), and stores the head on ``self.mtp_head``.
+        The head shares the base model's embed_tokens / lm_head (passed to
+        forward at decode time), so it adds only its own ~0.53 GB.
+        """
+        import os
+
+        from freetoken.models.qwen3_5_moe.mtp import Qwen3_5MTP, load_mtp_weights
+
+        head_path = config.mtp_head or os.path.join(config.model_path, "mtp_head.safetensors")
+        if not os.path.exists(head_path):
+            raise FileNotFoundError(
+                f"--mtp set but MTP head weights not found at {head_path!r}; "
+                "pass --mtp-head <path> to the 19-tensor mtp_head.safetensors."
+            )
+        t0 = time.time()
+        with torch.device("meta"), torch_dtype(config.dtype):
+            head = Qwen3_5MTP(config.model_config)
+        load_mtp_weights(head, head_path, config.dtype, self.device)
+        self.mtp_head = head
+        torch.cuda.synchronize()
+        logger.info_rank0(
+            f"MTP head loaded from {head_path} in {time.time() - t0:.1f}s "
+            f"(k=1, 256 experts nvfp4 GPU-resident; {mem_GB(self._sync_get_memory()[1])} free after)"
+        )
 
     def _resolve_hybrid_fetch(self, config: EngineConfig, cache) -> None:
         """Resolve --moe-hybrid-max-fetch -1 (auto) into a bandwidth-matched fetch fraction.

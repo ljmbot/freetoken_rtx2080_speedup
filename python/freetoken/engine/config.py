@@ -37,6 +37,16 @@ class EngineConfig:
     # scale (llama.cpp's Q8_0) instead of fp16. Halves KV VRAM. Dequantized in-kernel
     # before attention, so compute stays fp16. Off by default (byte-for-byte no-op).
     kv_q8: bool = False
+    # Multi-Token-Prediction self-speculative decode (--mtp): the Qwen3.5 "nextn"
+    # head drafts one token per step, verified by a 2-token base forward (k=1).
+    # Off by default (byte-for-byte no-op). Requires --kv-q8 for VRAM at 64K context.
+    mtp: bool = False
+    # MTP draft depth. Only k=1 is implemented (one head layer, one draft token per
+    # step); k>=2 is deferred. Kept for forward compatibility.
+    mtp_draft: int = 1
+    # Path to the mtp.* head safetensors (the 19 nextn tensors). Defaults to
+    # <model-path>/mtp_head.safetensors. Only read when mtp is set.
+    mtp_head: str | None = None
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
     # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8

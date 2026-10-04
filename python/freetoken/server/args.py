@@ -518,6 +518,34 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--mtp",
+        action="store_true",
+        default=ServerArgs.mtp,
+        help=(
+            "Enable Multi-Token-Prediction self-speculative decode (Qwen3.5 nextn "
+            "head, k=1: one draft token per step verified by a 2-token base forward). "
+            "Off by default (byte-for-byte no-op). Loads the mtp.* head weights "
+            "(separate safetensors; see --mtp-head). Requires --kv-q8 for the VRAM "
+            "headroom at 64K context."
+        ),
+    )
+    parser.add_argument(
+        "--mtp-draft",
+        type=int,
+        default=ServerArgs.mtp_draft,
+        help="MTP draft depth (k=1 only; k>=2 deferred).",
+    )
+    parser.add_argument(
+        "--mtp-head",
+        type=str,
+        default=None,
+        help=(
+            "Path to the mtp.* head safetensors (the 19 nextn tensors). Defaults to "
+            "<model-path>/mtp_head.safetensors. Only read when --mtp is set."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cache-policy",
         default=ServerArgs.moe_cache_policy,
         choices=["lru"],
