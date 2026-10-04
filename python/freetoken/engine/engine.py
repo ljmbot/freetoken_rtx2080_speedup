@@ -739,6 +739,202 @@ class Engine:
             f"(k=1, 256 experts nvfp4 GPU-resident; {mem_GB(self._sync_get_memory()[1])} free after)"
         )
 
+    # ==================================================================
+    # MTP self-speculative decode (Phase 4 S2).
+    # ==================================================================
+    def mtp_decode_step(
+        self,
+        prompt_ids: list[int],
+        gen: int,
+        table_idx: int = 1,
+        gdn_debug: bool = False,
+    ) -> dict:
+        """Run the full §4 k=1 MTP draft/verify/commit loop for one request.
+
+        Self-contained: does its own prefill + decode loop on this engine's real
+        state (production fused head, the S1 pre-final-norm hidden sink, the
+        GDN linear-state pool, and the request's page-table row). Returns the
+        committed tokens plus acceptance stats. This is the proven A2
+        ``mtp_loop`` (token-identical to greedy, acceptance 0.853) refactored to
+        operate on engine state instead of a standalone harness.
+
+        ``table_idx`` is the request's page-table row / GDN live slot (1 for a
+        fresh request; slot 0 is the padding sink). A dedicated scratch GDN slot
+        (``table_idx + 1``) holds the pre-verify snapshot for the reject-path
+        rollback. The caller must ensure no other request owns those slots.
+
+        ``gdn_debug``: when True, also return ``gdn_hashes`` — a list of
+        ``(committed_len, sha256)`` of the GDN live-slot state captured after
+        each commit step. Used by the S2 gate to verify the reject-path
+        rollback lands the GDN state exactly where a straight 1-token decode
+        would (the Phase 2 A1 primitive, re-asserted in-engine).
+        """
+        import hashlib
+
+        from freetoken.attention.linear import build_fla_metadata
+        from freetoken.models.qwen3_5_moe.mtp import _lm_logits
+
+        if self.mtp_head is None:
+            raise RuntimeError("mtp_decode_step called but no MTP head loaded (--mtp)")
+        if self.mtp_hidden is None:
+            raise RuntimeError("mtp_decode_step called but the hidden sink is not armed")
+        sink = self.mtp_hidden
+        assert sink is not None
+        pool = self.linear_state_pool
+        if pool is None:
+            raise RuntimeError("mtp_decode_step requires a GDN linear-state pool")
+        if table_idx + 1 >= pool.num_slots:
+            raise RuntimeError(
+                f"need a scratch GDN slot (table_idx+1={table_idx + 1}) but pool has "
+                f"{pool.num_slots} slots"
+            )
+        dev = self.device
+        live = table_idx
+        scratch = table_idx + 1
+        embed = self.model.model.embed_tokens
+        lm_head = self.model.lm_head
+
+        # Page table: position -> sequential slot (fresh request, no prefix cache).
+        n = min(len(self.page_table[live]), self.max_seq_len)
+        self.page_table[live, :n] = torch.arange(n, dtype=torch.int32, device=dev)
+
+        def base_forward(new_tokens, cached_len):
+            """Eager base forward over ``new_tokens`` at positions
+            [cached_len, cached_len+len). Returns the pre-final-norm hidden for
+            the new tokens (from the S1 tap sink). Always eager (never the
+            captured decode graph) — the MTP path replaces that graph."""
+            new = list(new_tokens)
+            device_len = cached_len + len(new)
+            req = Req(
+                input_ids=torch.zeros(device_len, dtype=torch.int32),
+                table_idx=live, cached_len=cached_len, output_len=1,
+                uid=0, sampling_params=None, cache_handle=None,
+                linear_slot_idx=live,
+            )
+            batch = Batch(reqs=[req], phase="decode" if len(new) == 1 else "prefill")
+            batch.padded_reqs = batch.reqs
+            batch.input_ids = torch.tensor(new, dtype=torch.int32, device=dev)
+            batch.positions = torch.arange(cached_len, device_len, dtype=torch.int32, device=dev)
+            batch.out_loc = self.page_table[live, cached_len:device_len]
+            if len(new) == 2:
+                # 2-token MTP verify: use the on-demand decode MoE path (load only the
+                # experts these 2 tokens route to) instead of the prefill path (which
+                # streams all 256 experts CPU->GPU, ~2400ms). GDN/attention stay on the
+                # prefill (extend) path. See Batch.moe_decode.
+                batch.moe_decode = True
+            if pool is not None:
+                if batch.is_decode:
+                    batch.linear_table_idx = torch.tensor([live], dtype=torch.int32, device=dev)
+                batch.fla_metadata = build_fla_metadata(batch, dev)
+            self.attn_backend.prepare_metadata(batch)
+            with self.ctx.forward_batch(batch):
+                self.model.forward()
+            pre = sink[0]
+            torch.cuda.synchronize()
+            return pre
+
+        def lmhead(hidden):
+            return _lm_logits(lm_head, hidden)
+
+        def gdn_hash():
+            if not gdn_debug:
+                return None
+            b = (
+                pool.conv_states[:, live].contiguous().view(torch.uint8).cpu().numpy().tobytes()
+                + pool.recurrent_states[:, live].contiguous().view(torch.uint8).cpu().numpy().tobytes()
+            )
+            return hashlib.sha256(b).hexdigest()[:16]
+
+        @torch.inference_mode()
+        def run():
+            import time as _time
+            pool.clear_slots([live])
+            pre = base_forward(list(prompt_ids), 0)
+            committed = len(prompt_ids)
+            h = pre[-1]
+            nxt = int(torch.argmax(lmhead(h.unsqueeze(0)), dim=-1).item())
+            out: list[int] = []
+            n_acc = n_rej = 0
+            gdn_hashes: list[tuple[int, str]] = []
+            # Per-component wall time (ms) for the perf investigation.
+            tm_head = tm_d1 = tm_d2 = tm_replay = 0.0
+
+            def _t0():
+                torch.cuda.synchronize()
+                return _time.perf_counter()
+
+            while len(out) < gen:
+                if len(out) == gen - 1:
+                    # Final token: nxt is the base model's real argmax for
+                    # position `committed` (set last iteration) — emit directly,
+                    # no head/verify/replay (matches greedy exactly).
+                    out.append(nxt)
+                    committed += 1
+                    ghn = gdn_hash()
+                    if ghn is not None:
+                        gdn_hashes.append((committed, ghn))
+                    break
+                # Step 1: propose (head sees 1 token).
+                _s = _t0()
+                draft = int(torch.argmax(
+                    self.mtp_head.forward(
+                        h.unsqueeze(0),
+                        torch.tensor([nxt], dtype=torch.int32, device=dev),
+                        torch.tensor([committed], dtype=torch.int32, device=dev),
+                        embed,
+                        lm_head,
+                    ),
+                    dim=-1,
+                ).item())
+                tm_head += (_t0() - _s) * 1000
+                # Step 2: verify via TWO 1-token decodes (not a 2-token extend).
+                #   d1: advance GDN by nxt (token at `committed`), get base argmax t1.
+                #   d2: advance GDN by draft (token at committed+1), get base argmax t2.
+                # Snapshot GDN after d1 / before d2 (state at `committed`) so a reject
+                # restores the correct 1-token-advanced state without a replay forward.
+                _s = _t0()
+                pre1 = base_forward([nxt], committed)
+                h1 = pre1[-1]
+                t1 = int(torch.argmax(lmhead(h1.unsqueeze(0)), dim=-1).item())
+                tm_d1 += (_t0() - _s) * 1000
+                pool.copy_from(live, scratch)
+                _s = _t0()
+                pre2 = base_forward([draft], committed + 1)
+                h2 = pre2[-1]
+                t2 = int(torch.argmax(lmhead(h2.unsqueeze(0)), dim=-1).item())
+                tm_d2 += (_t0() - _s) * 1000
+                if t1 == draft:
+                    # accept: commit both (GDN already advanced by d1+d2).
+                    out += [nxt, draft]
+                    committed += 2
+                    h = h2
+                    nxt = t2
+                    n_acc += 1
+                else:
+                    # reject: commit one; GDN rollback to pre-d1 (no replay needed).
+                    out += [nxt]
+                    committed += 1
+                    pool.copy_from(scratch, live)
+                    h = h1
+                    nxt = t1
+                    n_rej += 1
+                ghn = gdn_hash()
+                if ghn is not None:
+                    gdn_hashes.append((committed, ghn))
+            return out, n_acc, n_rej, gdn_hashes, (tm_head, tm_d1, tm_d2, tm_replay)
+
+        out, n_acc, n_rej, gdn_hashes, (tm_head, tm_d1, tm_d2, tm_replay) = run()
+        steps = n_acc + n_rej
+        return {
+            "tokens": out,
+            "accept": n_acc,
+            "reject": n_rej,
+            "acceptance": n_acc / max(steps, 1),
+            "gdn_hashes": gdn_hashes,
+            "timings_ms": {"head": tm_head, "d1": tm_d1, "d2": tm_d2, "replay": tm_replay,
+                            "n_acc": n_acc, "n_rej": n_rej},
+        }
+
     def _resolve_hybrid_fetch(self, config: EngineConfig, cache) -> None:
         """Resolve --moe-hybrid-max-fetch -1 (auto) into a bandwidth-matched fetch fraction.
 

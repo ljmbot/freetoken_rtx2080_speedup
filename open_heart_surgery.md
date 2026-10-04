@@ -313,6 +313,36 @@ Measured acceptance ~0.75–0.94 (varies by prompt).
 **Recommendation:** keep the (correct) MTP code, fix the snapshot bug, confirm the
 negative result, and record it. Do not proceed to S3 on this model.
 
+### S2 follow-up (2026-10-05) — snapshot bug fixed, R5 closed, negative result confirmed
+
+**Option 1 DONE.** Moved `pool.copy_from(live, scratch)` from before d1 to after d1
+(before d2). Re-ran the S2 gate + clean perf probe:
+- **Acceptance restored** to 0.75–0.94 on all 3 prompts (the prompt-1 collapse to 0.016
+  is gone) — confirms the snapshot bug was real and is fixed.
+- **Tokens still identical to greedy** on all 3 prompts (correctness holds).
+- **Clean speedup: 0.93–0.99×** (mtp 100–107 ms/tok vs ref 99–100 ms/tok). Confirms the
+  no-amortization ceiling: MTP at k=1 ≈ 1.0×, never above, on this model.
+
+**R5 CLOSED (gdn_match=False explained, not a bug).** New determinism probe
+(`s2_det.py`): two *independent* greedy decode runs (no MTP at all) on the same prompt —
+tokens identical, but GDN state traces diverge (max|delta|=0.44, first at commit 14).
+The 1-token decode forward itself is **non-deterministic** (fp16 kernel reduction order /
+non-deterministic expert-load ordering), so no two runs produce bit-identical GDN states
+even with no rollback involved. Therefore:
+- `gdn_match=False` in the S2 gate is **expected and harmless** — bit-identity of GDN
+  state is unachievable in principle on this stack, with or without MTP.
+- The **correct S2 gate is token-identity** (passes), which is what matters for output
+  correctness. The original "GDN rollback bit-exactness" sub-gate in the plan is
+  superseded by this finding.
+- The two-decode variant's rollback is still *correct by construction*: on reject it
+  restores the GDN state captured after d1, and d1 is the exact same 1-token decode the
+  greedy reference runs — same kernel, same token, same position. Any residual delta is
+  intrinsic forward non-determinism, not a rollback error.
+
+**Status: S2 code is correct, tested, and ready to commit. The negative perf result is
+confirmed and documented. Do NOT proceed to S3 (production wiring) on this model —
+MTP at k=1 cannot beat 1.0× here (structural, not a bug).**
+
 ### S3 — Scheduler wiring (size-1 decode batches, `--mtp` gated)
 - **Do:** in the scheduler decode path, when `--mtp` and the batch is a single decode
   request, call `engine.mtp_decode_step` instead of `forward_batch`; extend the commit

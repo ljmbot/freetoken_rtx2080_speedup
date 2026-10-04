@@ -143,9 +143,15 @@ class Batch:
     log_cached_tokens: int = field(default=0, init=False)
     # (uid, complete prompt length, prefix-cache hit) for requests entering their first
     # prepared prefill batch. The scheduler turns these into PromptAdmittedMsg only AFTER
-    # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
+    # _prepare_batch succeeds. Continuation chunks leave these empty, so accounting is
     # exactly-once.
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
+    # MTP verify: a short extend (e.g. the 2-token draft verification) that should use the
+    # DECODE MoE path (on-demand expert loading + the fused GEMV kernel) instead of the
+    # prefill path (which materializes ALL experts CPU->GPU -- ~2400ms for 256 experts,
+    # vs ~150ms for the on-demand 2-token decode load). GDN/attention still use the
+    # prefill (extend) path; only the MoE branch is switched. Default False (no effect).
+    moe_decode: bool = field(default=False, init=False)
 
     @property
     def is_prefill(self) -> bool:
@@ -154,6 +160,13 @@ class Batch:
     @property
     def is_decode(self) -> bool:
         return self.phase == "decode"
+
+    @property
+    def is_moe_prefill(self) -> bool:
+        """MoE path selector: True when the MoE layer should stream all experts
+        (prefill). A ``moe_decode`` batch (MTP verify) uses the on-demand decode
+        MoE path even though its GDN/attention phase is prefill."""
+        return self.phase == "prefill" and not self.moe_decode
 
     @property
     def size(self) -> int:
