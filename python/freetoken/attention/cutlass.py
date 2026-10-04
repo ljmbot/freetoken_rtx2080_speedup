@@ -59,7 +59,30 @@ class CutlassAttentionBackend(TritonAttentionBackend):
         super().__init__(config)
         self._cutlass_enabled = True  # gated by explicit --attention-backend cutlass
 
-    def _cutlass_prefill(self, q, k_cache, v_cache, metadata, scale, kv_heads, head_dim):
+    def _dequant_kv(
+        self,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        k_scale_flat: torch.Tensor,
+        v_scale_flat: torch.Tensor,
+        slots: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Dequant the K/V at paged-cache slots ``[num_slots]`` to ``dtype`` (fp16).
+
+        The Q8_0 cache is int8 with a per-(token, head) fp32 scale; the CUTLASS SDPA
+        paths need fp16, so dequant the selected subset here (the Triton kernels
+        dequantize in-kernel instead). Returns ``(k, v)`` each ``[num_slots, kv_heads,
+        head_dim]`` in ``dtype``.
+        """
+        k = k_cache[slots].to(torch.float32)
+        v = v_cache[slots].to(torch.float32)
+        ks = k_scale_flat[slots].unsqueeze(-1)  # [num_slots, kv_heads, 1]
+        vs = v_scale_flat[slots].unsqueeze(-1)
+        return (k * ks).to(dtype), (v * vs).to(dtype)
+
+    def _cutlass_prefill(self, q, k_cache, v_cache, metadata, scale, kv_heads, head_dim,
+                         k_scale_flat=None, v_scale_flat=None):
         """Dense fresh-prefill (prefix==0 for every request) via CUTLASS mem-efficient.
 
         Returns the output in the same layout as the Triton extend kernel
@@ -88,6 +111,15 @@ class CutlassAttentionBackend(TritonAttentionBackend):
         # so read them directly rather than gathering from the paged cache.
         k4 = k_cache[metadata.indptr[0] : metadata.indptr[1]].permute(1, 0, 2).unsqueeze(0)
         v4 = v_cache[metadata.indptr[0] : metadata.indptr[1]].permute(1, 0, 2).unsqueeze(0)
+        if k_scale_flat is not None:
+            # Q8_0: dequant the dense slice to fp16 before SDPA.
+            k4, v4 = self._dequant_kv(
+                k_cache, v_cache, k_scale_flat, v_scale_flat,
+                torch.arange(metadata.indptr[0], metadata.indptr[1], device=q.device),
+                q.dtype,
+            )
+            k4 = k4.permute(1, 0, 2).unsqueeze(0)
+            v4 = v4.permute(1, 0, 2).unsqueeze(0)
         # GQA -> MHA (CUTLASS mem-efficient requires equal q/kv head counts).
         if g != 1:
             k4 = k4.repeat_interleave(g, dim=1)
@@ -101,7 +133,8 @@ class CutlassAttentionBackend(TritonAttentionBackend):
         return o4.permute(0, 2, 1, 3).squeeze(0)
 
     def _cutlass_extend(
-        self, q, k_cache, v_cache, indices, metadata, scale, kv_heads, head_dim
+        self, q, k_cache, v_cache, indices, metadata, scale, kv_heads, head_dim,
+        k_scale_flat=None, v_scale_flat=None,
     ):
         """Paged prefix-extend (chunk 2+ of a chunked prefill) via CUTLASS mem-efficient.
 
@@ -151,8 +184,14 @@ class CutlassAttentionBackend(TritonAttentionBackend):
             return None
 
         # Gather the request's full KV (prefix + extend) in token order.
-        k_full = k_cache[indices]  # [device_len, kv_heads, hd]
-        v_full = v_cache[indices]  # [device_len, kv_heads, hd]
+        if k_scale_flat is not None:
+            # Q8_0: dequant the gathered int8 KV to fp16 before SDPA.
+            k_full, v_full = self._dequant_kv(
+                k_cache, v_cache, k_scale_flat, v_scale_flat, indices, q.dtype
+            )
+        else:
+            k_full = k_cache[indices]  # [device_len, kv_heads, hd]
+            v_full = v_cache[indices]  # [device_len, kv_heads, hd]
         q4 = q.permute(1, 0, 2).unsqueeze(0)  # [1, Hq, t, hd]
         if g != 1:
             k4 = k_full.permute(1, 0, 2).unsqueeze(0).repeat_interleave(g, dim=1)
@@ -194,6 +233,16 @@ class CutlassAttentionBackend(TritonAttentionBackend):
         k_cache = k_raw.view(-1, kv_heads, head_dim)
         v_cache = v_raw.view(-1, kv_heads, head_dim)
 
+        # Q8_0 KV cache: the cache is int8 + per-(token, head) fp32 scales. The Triton
+        # kernels dequantize in-kernel (they take k_scale/v_scale); the CUTLASS SDPA
+        # paths dequantize the gathered subset to fp16 first (they cannot read int8).
+        q8 = getattr(self.kvcache, "q8", False)
+        if q8:
+            k_scale_flat = self.kvcache.k_scale(layer_id).reshape(-1, kv_heads)
+            v_scale_flat = self.kvcache.v_scale(layer_id).reshape(-1, kv_heads)
+        else:
+            k_scale_flat, v_scale_flat = None, None
+
         spec = attn_spec or AttentionSpec()
         indices = metadata.indices
         if spec.sliding_window is not None and metadata.swa_indices is not None:
@@ -221,6 +270,8 @@ class CutlassAttentionBackend(TritonAttentionBackend):
                 sm_scale=scale,
                 sliding_window=spec.sliding_window,
                 sinks=spec.sinks,
+                k_scale=k_scale_flat,
+                v_scale=v_scale_flat,
             )
 
         # Prefill (dense, no sliding window, no sinks): CUTLASS mem-efficient.
@@ -234,12 +285,14 @@ class CutlassAttentionBackend(TritonAttentionBackend):
             and spec.sinks is None
         ):
             o = self._cutlass_prefill(
-                q, k_cache, v_cache, metadata, scale, kv_heads, head_dim
+                q, k_cache, v_cache, metadata, scale, kv_heads, head_dim,
+                k_scale_flat, v_scale_flat,
             )
             if o is not None:
                 return o
             o = self._cutlass_extend(
-                q, k_cache, v_cache, indices, metadata, scale, kv_heads, head_dim
+                q, k_cache, v_cache, indices, metadata, scale, kv_heads, head_dim,
+                k_scale_flat, v_scale_flat,
             )
             if o is not None:
                 return o
@@ -264,6 +317,8 @@ class CutlassAttentionBackend(TritonAttentionBackend):
                 sinks=spec.sinks,
                 k_extend=k.view(q.shape[0], kv_heads, head_dim),
                 v_extend=v.view(q.shape[0], kv_heads, head_dim),
+                k_scale=k_scale_flat,
+                v_scale=v_scale_flat,
             )
         return paged_attention(
             q=q,
@@ -276,4 +331,6 @@ class CutlassAttentionBackend(TritonAttentionBackend):
             sm_scale=scale,
             sliding_window=spec.sliding_window,
             sinks=spec.sinks,
+            k_scale=k_scale_flat,
+            v_scale=v_scale_flat,
         )

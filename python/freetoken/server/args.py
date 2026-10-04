@@ -506,6 +506,16 @@ def parse_args(
         default=ServerArgs.kv_reserve_tokens,
         help="KV-cache token floor reserved before --moe-cache-auto fills experts.",
     )
+    parser.add_argument(
+        "--kv-q8",
+        action="store_true",
+        default=ServerArgs.kv_q8,
+        help=(
+            "Store the paged K/V cache as Q8_0 (int8 + per-(token,head) fp32 scale) "
+            "instead of fp16. Halves KV VRAM; dequantized in-kernel before attention "
+            "so compute stays fp16. Off by default (byte-for-byte no-op)."
+        ),
+    )
 
     parser.add_argument(
         "--moe-cache-policy",

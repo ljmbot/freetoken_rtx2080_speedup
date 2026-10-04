@@ -63,7 +63,16 @@ class BaseKVCachePool(ABC):
         """Largest usable page count fitting ``available_memory`` (bytes measured by the
         engine: memory_ratio x baseline free minus resident weights and any sibling pool's
         fixed cost), honoring ``config.num_page_override``."""
-        cache_per_page, fixed_cache_size, _, _ = cls.kv_cost(config)
+        import inspect
+
+        # Forward family-specific cost knobs (Q8 for the MHA pool) only when that family
+        # declares them -- mirrors validate_rebuild's signature introspection, so a
+        # kv_q8-enabled config never breaks an fp16-only pool family.
+        cost_params = inspect.signature(cls.kv_cost).parameters
+        cost_kwargs = {}
+        if "kv_q8" in cost_params:
+            cost_kwargs["kv_q8"] = getattr(config, "kv_q8", False)
+        cache_per_page, fixed_cache_size, _, _ = cls.kv_cost(config, **cost_kwargs)
         num_pages = config.num_page_override
         if num_pages is None:
             num_pages = (available_memory - fixed_cache_size) // cache_per_page
@@ -162,6 +171,19 @@ class BaseKVCachePool(ABC):
     @property
     @abstractmethod
     def num_layers(self) -> int: ...
+
+    @property
+    def q8(self) -> bool:
+        """True when the pool stores Q8_0 (int8 + fp32 scale) KV. Default fp16/bf16."""
+        return False
+
+    def k_scale(self, index: int) -> torch.Tensor:
+        """Per-(token, head) fp32 K scale (Q8 only). Subclasses override; raises otherwise."""
+        raise NotImplementedError(f"{type(self).__name__} does not support Q8 KV")
+
+    def v_scale(self, index: int) -> torch.Tensor:
+        """Per-(token, head) fp32 V scale (Q8 only). Subclasses override; raises otherwise."""
+        raise NotImplementedError(f"{type(self).__name__} does not support Q8 KV")
 
 
 @dataclass(frozen=True)

@@ -156,6 +156,14 @@ class TritonAttentionBackend(BaseAttnBackend):
         k_cache = k_raw.view(-1, kv_heads, head_dim)
         v_cache = v_raw.view(-1, kv_heads, head_dim)
 
+        # Q8_0 KV cache: the Triton kernels dequantize in-kernel via k_scale/v_scale.
+        q8 = getattr(self.kvcache, "q8", False)
+        if q8:
+            k_scale_flat = self.kvcache.k_scale(layer_id).reshape(-1, kv_heads)
+            v_scale_flat = self.kvcache.v_scale(layer_id).reshape(-1, kv_heads)
+        else:
+            k_scale_flat, v_scale_flat = None, None
+
         spec = attn_spec or AttentionSpec()
         indices = metadata.indices
         if spec.sliding_window is not None and metadata.swa_indices is not None:
@@ -181,6 +189,8 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sm_scale=scale,
                 sliding_window=spec.sliding_window,
                 sinks=spec.sinks,
+                k_scale=k_scale_flat,
+                v_scale=v_scale_flat,
             )
         if (
             (not metadata.is_decode)
@@ -201,6 +211,8 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sinks=spec.sinks,
                 k_extend=k.view(q.shape[0], kv_heads, head_dim),
                 v_extend=v.view(q.shape[0], kv_heads, head_dim),
+                k_scale=k_scale_flat,
+                v_scale=v_scale_flat,
             )
         return paged_attention(
             q=q,
@@ -213,6 +225,8 @@ class TritonAttentionBackend(BaseAttnBackend):
             sm_scale=scale,
             sliding_window=spec.sliding_window,
             sinks=spec.sinks,
+            k_scale=k_scale_flat,
+            v_scale=v_scale_flat,
         )
 
     def prepare_metadata(self, batch: Batch) -> None:

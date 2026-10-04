@@ -33,6 +33,10 @@ class EngineConfig:
     moe_cache_auto: bool = False
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
     moe_cache_policy: str = "lru"
+    # Q8_0 KV cache (--kv-q8): store the paged K/V as int8 + per-(token,head) fp32
+    # scale (llama.cpp's Q8_0) instead of fp16. Halves KV VRAM. Dequantized in-kernel
+    # before attention, so compute stays fp16. Off by default (byte-for-byte no-op).
+    kv_q8: bool = False
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
     # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8
