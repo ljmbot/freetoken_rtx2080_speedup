@@ -294,6 +294,35 @@ GDN state trajectory differs.
 - **Stop:** headroom can't be preserved → **abort MTP** (keep Q8-KV), report.
   Do not silently shrink `--moe-cache-size` — that costs decode hit-rate.
 
+**Phase 3 RESULT (2026-10-04): PASS — all three gates.**
+Harness `~/.hermes/cache/scratch/phase3_mtp_head.py` is standalone (like A1):
+builds the live Q8-KV engine, loads the 19-tensor `mtp_head.safetensors` (all bf16),
+hand-quantizes the 256 routed experts bf16→nvfp4 (modelopt not installed), and runs
+the 2-token alpha sample. It proves the head math + quantize + VRAM before any
+engine wiring (the `--mtp` flag, loader, and KV-pool +1 layer are Phase 4).
+
+| gate | result |
+|---|---|
+| **(1) quantize vs `dequant_nvfp4`** | **PASS** — kernel-vs-ref **0.000000** (my packed bytes read bit-exactly by the codebase's own kernel); mean rel 0.276 (gu) / 0.247 (dn), the expected e2m1 4-bit-mantissa error |
+| **(2) VRAM free after head load** | **PASS** — head = 0.532 GB (experts nvfp4 0.454 GB + other 0.079 GB); **2.25 GiB free ≥ 2.0** |
+| **(3) 2-token alpha ≈ 0.87** | **PASS** — **0.8548** (pre_norm, 53/62) with the *quantized* experts (ref 0.872, ≥ 0.75 floor) |
+
+- **Projected MTP speedup (draft-1, r=1.041, alpha 0.8548): 1.78× → ~43 tok/s**
+  (baseline 24 tok/s). The alpha is slightly below the bf16 reference (0.8548 vs
+  0.872) because it uses the nvfp4-quantized experts, which is the *production*
+  path — so the projection is conservative, not optimistic.
+- **OOM fixes baked into the harness (reproducible):** (a) quantize runs **on CPU**
+  in 32-expert chunks (the full `[256,1024,2048].float()` = 2 GiB fp32 transient
+  OOMs against the ~1 GiB free after the base model + offload expert cache); only
+  the small packed/scale/global outputs (~0.45 GB) are copied to GPU. (b) the alpha
+  run's MoE dequantizes the union of experts **position-chunked** (4 tokens → ≤32
+  experts ≈ 200 MB), since a full-sequence union could hit all 256 experts (1.6 GB).
+  (c) the alpha uses the validated `measure_alpha.py` head math (self-contained SDP
+  over the head's own input), not the base paged KV — the KV-pool +1 layer is a
+  Phase-4 multi-token-draft concern, not the 2-token gate.
+- **The `--mtp` flag is NOT yet wired** (that is Phase 4). Phase 3 proves the three
+  load/VRAM/alpha gates; Phase 4 adds the loader + engine loop and re-verifies A2.
+
 ### Phase 4 — Speculative decode loop
 - Wire the §4 loop into `engine/engine.py` (+ a small scheduler branch), gated by
   `--mtp`; fused/offload paths untouched when off.
