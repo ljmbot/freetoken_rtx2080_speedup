@@ -362,13 +362,26 @@ and compares token-for-token against a straight greedy decode (1-token steps).
   as the base model (~1 base-layer cost ≈ 5ms), so ε≈0 and the §4 cost model
   (1.6×) should hold. The Phase 5 A/B measures the real number with the fused kernel.
 
+**Phase 4 production module + loader (2026-10-04): DONE + validated.**
+- `python/freetoken/models/qwen3_5_moe/mtp.py` (new): `Qwen3_5MTP` (the head) +
+  `quantize_nvfp4` + `load_mtp_weights`. The head is the A2-validated math, but the
+  MoE now uses the **fused nvfp4 decode kernel** (`fused_experts_decode_nvfp4_marlin`)
+  with the 256 experts **GPU-resident** (indexed by raw expert id — no PCIe, no
+  offload-cache contention). Attention is self-contained (k=1, no KV-pool layer).
+- **Validation** (`phase4_module_test.py`): built the production head with the real
+  config, loaded the real 19 tensors via `load_mtp_weights`, and compared its output
+  against the A2-validated reference math (dequant-then-einsum) on the same
+  quantized experts. **argmax_match=True; max|d|=7.8e-3, mean_rel=2.2e-3** (k=1) and
+  same at L=3 — pure fp16 rounding between the fused-kernel path and the reference.
+  So the production head is numerically faithful to what A2 already proved
+  token-identical end-to-end.
+
 **Remaining Phase 4 work (production wiring, not yet done):**
 - `--mtp` flag in `args.py` (default off; no-op when off).
-- `mtp.py` head module (port the fork's `Qwen3_5MTP` — validated math).
-- `load_mtp_weights()` (dedicated loader; main `load_state_dict` untouched).
+- `load_mtp_weights()` is done (in `mtp.py`); wire it into the model/engine load
+  path (main `load_state_dict` untouched; `mtp.*` still dropped from the main pass).
 - Engine decode loop (§4) + GDN rollback wiring, gated by `--mtp`.
-- The harness head-MoE should be swapped to the fused kernel before the A/B
-  (Phase 5) so the speedup is measured with production kernels.
+- Pre-final-norm hidden extraction from the production base forward for the head.
 
 ### Phase 5 — A/B benchmark (the user's real workload)
 - Workload: **C coding, Java coding, bug hunts, doc-gen from C** (low-entropy →
