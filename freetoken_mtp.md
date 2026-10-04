@@ -333,6 +333,43 @@ engine wiring (the `--mtp` flag, loader, and KV-pool +1 layer are Phase 4).
   overwritten next step).
 - **Gate:** Phase-2 A2 passes (token-identical to greedy) on ≥ 3 prompts.
 
+**Phase 4 A2 RESULT (2026-10-04): PASS — token-identical to greedy.**
+Standalone harness `~/.hermes/cache/scratch/phase4_a2_loop.py` (mirrors A1 + Phase 3):
+builds the real production engine (Q8-KV, production flags), loads + quantizes the
+head (Phase 3's proven path), then runs the §4 k=1 loop (propose→verify→commit/rollback)
+and compares token-for-token against a straight greedy decode (1-token steps).
+
+| prompt | tokens | match | accept/reject | greedy | mtp (harness) |
+|---|---|---|---|---|---|
+| C linked-list reverse | 24 | **identical** | 11/1 | 5.07s | 31.85s |
+| Java word-count | 24 | **identical** | 10/3 | 4.84s | 34.39s |
+| printing-press prose | 24 | **identical** | 10/3 | 4.82s | 34.47s |
+
+- **Token-identity: PASS** (3 prompts × 24 tokens, zero divergence). Acceptance
+  31/38 = **0.816** (close to the 0.872 reference; the harness uses the nvfp4
+  quantized experts, the production path).
+- **k=1 → no extra KV layer needed.** The head only ever sees 1 token per draft, so
+  its attention is self-contained (Phase 3 proved this with SDP). The KV-pool +1
+  layer is only needed for k≥2 multi-token drafts (deferred).
+- **GDN rollback validated live.** The reject path (snapshot→2-token verify→restore→
+  1-token replay) is exercised on real rejects (7 total) and produces token-identical
+  output — confirming A1's bit-exact result holds in the full loop with the head in
+  the picture.
+- **PERF CAVEAT (harness artifact, not a loop bug):** the harness MTP path is ~3.5×
+  *slower* than greedy (31s vs 5s for 24 tokens) because the harness head-MoE is
+  **dequant-then-einsum** (materializes the expert union, ~2.7s per head forward),
+  not the fused nvfp4 kernel. In production the head-MoE uses the same fused kernel
+  as the base model (~1 base-layer cost ≈ 5ms), so ε≈0 and the §4 cost model
+  (1.6×) should hold. The Phase 5 A/B measures the real number with the fused kernel.
+
+**Remaining Phase 4 work (production wiring, not yet done):**
+- `--mtp` flag in `args.py` (default off; no-op when off).
+- `mtp.py` head module (port the fork's `Qwen3_5MTP` — validated math).
+- `load_mtp_weights()` (dedicated loader; main `load_state_dict` untouched).
+- Engine decode loop (§4) + GDN rollback wiring, gated by `--mtp`.
+- The harness head-MoE should be swapped to the fused kernel before the A/B
+  (Phase 5) so the speedup is measured with production kernels.
+
 ### Phase 5 — A/B benchmark (the user's real workload)
 - Workload: **C coding, Java coding, bug hunts, doc-gen from C** (low-entropy →
   alpha should be ≥ the 0.872 prose figure).
