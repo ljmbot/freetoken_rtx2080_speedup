@@ -8,8 +8,10 @@ needs (`qwen.sh`: `--num-tokens 64000 --max-seq-len-override 64000`).
 
 Feasibility is **measured, not projected** — GO. This plan is the build + test
 sequence, organized into **phases with hard gates** and a **stop condition** at
-each. Work happens on branch `perf/mtp-decode` (branched off `perf/sm75-prefill`),
-so the tuned prefill config is the untouched baseline.
+each. Work happens on branch `perf/mtp-decode`, which is built **on top of the
+committed prefill baseline** (commit `4d5d0fb` on `perf/sm75-prefill`). The tuned
+prefill path (cutlass backend, GDN sm75 tuning, cuBLAS prefill, tuned `qwen.sh`)
+is committed and safe — see §0.
 
 **Priority order (user-confirmed 2026-10-04):** **Q8 KV cache is Phase 1 and is
 the VRAM prerequisite for MTP.** MTP's head + the 61K prefill transient do not
@@ -23,22 +25,28 @@ MTP later aborts — so it is not wasted work.
 
 If any phase proves too hard, the way back is clean and artifact-free:
 
-1. **All code lives on `perf/mtp-decode`** — never on `perf/sm75-prefill` or the
-   main branch. No source file in the baseline branch is modified.
-2. **`--mtp` is default-off.** When the flag is absent, the engine is byte-for-byte
+1. **All MTP code lives on `perf/mtp-decode`** — never on `perf/sm75-prefill` or
+   the main branch. No source file in the baseline branch is modified.
+2. **The prefill baseline is committed.** Commit `4d5d0fb` on `perf/sm75-prefill`
+   captures the tuned prefill path (cutlass backend, GDN sm75 tuning, cuBLAS
+   prefill, tuned `qwen.sh`, benchmark harnesses + results). `perf/mtp-decode`
+   fast-forwards onto it, so the prefill work is **permanently safe on its own
+   branch** — discarding the MTP branch loses nothing of it.
+3. **`--mtp` is default-off.** When the flag is absent, the engine is byte-for-byte
    the current FreeToken. The flag is a no-op when off (verified in Phase 5).
-3. **`--kv-q8` is default-off** (Phase 1). When off, the KV pool is the current
+4. **`--kv-q8` is default-off** (Phase 1). When off, the KV pool is the current
    fp16 pool. No-op when off (verified in Phase 1).
-4. **Dedicated MTP weight loader** (`load_mtp_weights`) — the strict main
+5. **Dedicated MTP weight loader** (`load_mtp_weights`) — the strict main
    `load_state_dict` in `weight.py` is **not touched**. `mtp.*` stays dropped from
    the main pass.
-5. **No production-config edits.** `qwen.sh` is only extended (flags added) for the
+6. **No production-config edits.** `qwen.sh` is only extended (flags added) for the
    A/B run; the baseline invocation is unchanged.
-6. **Scratch stays out of the repo.** Measurement scripts and the downloaded
+7. **Scratch stays out of the repo.** Measurement scripts and the downloaded
    `mtp_head.safetensors` live in `~/.hermes/cache/scratch/`, not the repo.
 
 **Rollback command:** `git checkout perf/sm75-prefill && git branch -D perf/mtp-decode`
-→ clean working FreeToken, zero artifacts, zero config drift.
+→ clean working FreeToken **with all prefill improvements intact** (they're in
+commit `4d5d0fb`), zero MTP artifacts, zero config drift.
 
 A phase is **abandoned** (not "fixed at all costs") when its stop condition fires.
 Abandoning a phase = stop, report the honest number, and the branch is discardable.
@@ -178,9 +186,11 @@ A/B in Phase 5 measures the real number.
 ## 5. Phases (each gated; a failed gate stops that phase, not the branch)
 
 ### Phase 0 — Baseline verification
-Confirm the tuned config is the untouched baseline before any change.
-- Run `qwen.sh` as-is; measure decode + prefill tok/s; confirm `git status` clean
-  on `perf/mtp-decode`.
+Confirm the committed baseline is the untouched tuned config before any change.
+- Confirm `git status` clean on `perf/mtp-decode` (it is: prefill work is commit
+  `4d5d0fb`, MTP plan is `0e9a013`); confirm `qwen.sh` has the tuned flags
+  (cutlass, `--moe-cache-size 512`, `--disable-moe-prefill-overlap`, 64000).
+- Run `qwen.sh` as-is; measure decode + prefill tok/s.
 - **Gate:** decode ≈ 19.9 tok/s, prefill ≈ 484 tok/s, tree clean.
 - **Stop:** if baseline numbers are off, stop and reconcile first (do not build on
   a moving baseline).
