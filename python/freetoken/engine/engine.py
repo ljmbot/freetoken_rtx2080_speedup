@@ -723,6 +723,16 @@ class Engine:
         head = Qwen3_5MTP(config.model_config)  # CPU build (weights land on GPU in the loader)
         load_mtp_weights(head, head_path, config.dtype, self.device)
         self.mtp_head = head
+        # S1: arm the base model's pre-final-norm hidden tap. The model writes the
+        # residual-sum (pre-final-norm) hidden into this sink on every forward; the
+        # decode loop reads it to feed the MTP head. Only armed here, so with --mtp
+        # off the sink stays None and the model forward is a byte-for-byte no-op.
+        base = getattr(self.model, "model", None)
+        if base is not None and hasattr(base, "mtp_hidden_sink"):
+            base.mtp_hidden_sink = [None]
+            self.mtp_hidden = base.mtp_hidden_sink  # [0] holds the last forward's hidden
+        else:
+            self.mtp_hidden = None
         torch.cuda.synchronize()
         logger.info_rank0(
             f"MTP head loaded from {head_path} in {time.time() - t0:.1f}s "

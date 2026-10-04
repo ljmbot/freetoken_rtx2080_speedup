@@ -78,13 +78,23 @@ class Qwen3_5Model(BaseOP):
             [Qwen3_5DecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Optional MTP pre-final-norm hidden tap (S1). The engine sets this to a
+        # 1-element list when --mtp is on; forward stores the pre-final-norm hidden
+        # (the residual sum BEFORE the final GemmaRMSNorm — the value the MTP head
+        # consumes) there. Default None: the final line below is a plain no-op
+        # (byte-for-byte identical to the pre-S1 forward) when MTP is off.
+        self.mtp_hidden_sink: list | None = None
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
         residual: torch.Tensor | None = None
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
-        x, _ = self.norm.forward_add_residual(x, residual)
+        # fused_add_rmsnorm is in-place: after the call `residual` holds the
+        # pre-final-norm hidden (residual += x) and `x` the final-normed output.
+        x, residual = self.norm.forward_add_residual(x, residual)
+        if self.mtp_hidden_sink is not None:
+            self.mtp_hidden_sink[0] = residual
         return x
 
 

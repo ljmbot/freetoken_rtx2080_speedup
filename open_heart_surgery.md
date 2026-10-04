@@ -180,6 +180,11 @@ A failed gate = stop, diagnose, do NOT proceed. Every commit advances the floor.
 - **Gate:** mixed-512 ≈ 24.49 tok/s (±3%), 64K context loads, ~2 GiB headroom.
 - **Test:** existing Phase 0 harness; record numbers in this file.
 - **Commit:** none (just a recorded checkpoint).
+- **RESULT: PASS (2026-10-04).** Server: 64K KV 0.62 GiB, 2.72 GiB free after
+  graphs, `mtp=False`. Medians vs Phase 0: mixed-512 23.87 (−2.5%), mixed-2048
+  23.06 (−3.8%), agent-envelope 22.51 (−3.6%), prefix-cached 24.62 (−2.8%). All
+  within normal run-to-run variance (Phase 0 mixed-512 ranged 24.01–24.73). Decode
+  path unchanged and healthy. Results: `artifacts/sm75-prefill/results-s0.jsonl`.
 
 ### S1 — Hidden-state tap (no behavior change)
 - **Do:** add the gated pre-final-norm hidden tap to the base model's final norm;
@@ -191,6 +196,22 @@ A failed gate = stop, diagnose, do NOT proceed. Every commit advances the floor.
     (max |Δ| = 0, since it's the same tensor).
 - **Test:** small script comparing tapped `h` vs A2's `pre[-1]` on 3 prompts.
 - **Commit:** `S1: gated pre-final-norm hidden tap (no-op when --mtp off)`.
+- **RESULT: PASS (2026-10-04).** Tap added to `Qwen3_5Model.forward` (the `_`
+  that discarded the residual-sum is now a gated `mtp_hidden_sink`); armed in
+  `Engine._init_mtp_head` (only runs when `--mtp`). `fused_add_rmsnorm` is
+  in-place, so `residual` after the call *is* the pre-final-norm hidden (what A2
+  captured as `summ`).
+  - `--mtp` ON (`s1_tap_on.py`): sink armed + wired; 1-token decode sink and
+    2-token extend sink both **bit-exact (max|d|=0.000e+00)** vs the independent
+    A2 monkeypatch capture.
+  - `--mtp` OFF (`s1_tap_off.py`): sink stays `None`, forward is a no-op, greedy
+    decode still works.
+  - **Graph caveat (resolved):** the MTP decode loop is entirely eager (verify =
+    2-token extend, reject = 1-token replay; both bypass the graph runner, as the
+    A2 oracle does). The "normal" 1-token decode that uses the captured graph is
+    exactly what the MTP step replaces, so the MTP path never replays a graph and
+    the eager tap is sufficient. The sink is armed before `GraphRunner` is built
+    (line 345 < 416), so capture with `--mtp` on is harmless.
 
 ### S2 — `Engine.mtp_decode_step` (the core, standalone)
 - **Do:** implement `mtp_decode_step(req, ...)` per §4, reusing the proven
