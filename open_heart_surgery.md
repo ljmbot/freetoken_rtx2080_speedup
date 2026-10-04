@@ -232,6 +232,87 @@ A failed gate = stop, diagnose, do NOT proceed. Every commit advances the floor.
   a GDN-state hash after each reject.
 - **Commit:** `S2: Engine.mtp_decode_step (draft->verify->commit/rollback, k=1)`.
 
+### S2 investigation findings (2026-10-04, UNCOMMITTED — read before continuing)
+
+**TL;DR: MTP at k=1 does NOT speed up decode on this model. Clean measurement gives
+0.78–0.91× (i.e. *slower* than greedy). The earlier "1.16–1.36×" I reported was a
+measurement artifact — the S2 gate's reference loop included `gdn_hash` D2H copies
+that slowed the *reference* more than MTP. Root cause: the 2-token verify does not
+amortize — it costs ~2× a 1-token decode because the MoE experts are loaded
+on-demand *per token*, so 2 tokens load ~2× the experts. This is a structural
+limitation of MTP at k=1 on an on-demand-MoE model, not a bug. The original
+~1.6–1.8× goal is not reachable with MTP at k=1 on this model.**
+
+**Clean perf numbers (real varying tokens, prefill subtracted, no gdn_hash overhead):**
+
+| Component | Cost |
+|---|---|
+| ref 1-token decode (D) | 93 ms/tok |
+| head (H, draft) | 3 ms |
+| d1 / d2 (1-token decode, two-decode variant) | 87 ms each |
+| 2-token verify (V, two-token-extend variant) | 190 ms |
+| replay (R, 1-token, reject-only, two-token-extend variant) | 87 ms |
+
+Measured acceptance ~0.75–0.94 (varies by prompt).
+
+**Speedup, by variant (decode-only):**
+- Two-token-extend + replay: accept=(H+V)/2=96.5, reject=H+V+R=280 → ~0.75–0.91×.
+- Two-decode (no replay): accept=(H+d1+d2)/2=88.5, reject=H+d1+d2=177 → ~0.91× at p=0.85.
+- Both are **below 1.0×**. The two-decode variant is strictly better and is the one
+  currently in the tree.
+
+**Root cause — the verify does not amortize (the crux):**
+- On a *dense* model a 2-token forward is memory-bandwidth-bound (weights loaded once,
+  shared by both tokens) → V ≈ D → MTP would win.
+- On *this* MoE model the experts are loaded on-demand **per token**. 2 tokens route to
+  ~16 experts (vs ~8 for 1 token), each a separate GEMV → V ≈ 2D. Measured V=190ms ≈
+  2×D(93ms). Confirmed.
+- Consequence: MTP at k=1 does 2 base forwards per step for 1–2 tokens ≈ 2× the work
+  per token at best → it **can never exceed 1.0×** on this model, regardless of
+  acceptance or head cost. (The head is cheap, H/D≈0.03, so it's not the issue.)
+
+**The two-decode variant (currently in the tree) has a snapshot BUG I introduced:**
+- Idea: split the 2-token verify into two 1-token decodes (d1, d2). A reject then only
+  needs a GDN snapshot restore (no replay), and the path uses the same 1-token decode
+  kernel as greedy → should make the GDN state **bit-identical** to greedy (resolves R5).
+- Bug: the GDN snapshot is taken **before d1**, but on reject the state must be
+  **after d1** (S_{C+1}), not before d1 (S_C). As written, a reject rolls GDN back one
+  step too far → every subsequent hidden state is computed with the wrong GDN state →
+  cascading divergence → the draft is almost always wrong (prompt1 acceptance collapsed
+  to 0.016 in the probe). **Fix: move `pool.copy_from(live, scratch)` from before d1 to
+  before d2.** Then a reject restores S_{C+1}, correct for committed=C+1.
+- Even fixed, the two-decode variant caps at ~0.91× (no amortization) — but it is the
+  cleaner variant and resolves R5.
+
+**Uncommitted working-tree state (3 files modified, nothing committed since b751abf):**
+- `engine.py` — `mtp_decode_step` now has the **TWO-DECODE** variant (with the snapshot
+  bug above) + per-component timing. The `batch.moe_decode=True` wiring is now unused
+  (two-decode uses 1-token decodes, not a 2-token extend).
+- `core.py` — `Batch.moe_decode` flag + `is_moe_prefill` property (used only by the
+  two-token-extend variant).
+- `layers/moe.py` — `OffloadMoELayer.forward` + `routed_forward` branch on
+  `is_moe_prefill` (the moe_decode fix; still correct and harmless).
+- Scratch probes: `s2_perf_probe.py` (clean perf), `s2_diag*.py` (cost breakdowns).
+
+**Options for tomorrow (ranked):**
+1. **Fix the two-decode snapshot bug** (move `copy_from` before d2) and re-run
+   `s2_perf_probe.py` to confirm ~0.91× **and** bit-identical GDN state vs greedy
+   (this would close R5 / `gdn_match=False`). Cheapest, highest-value next step.
+2. **Confirm the "verify does not amortize" root cause** with one clean V-vs-D probe
+   (expect V/D ≈ 2). If confirmed, the negative result is solid.
+3. **Quick check: larger `--moe-cache-size`** (512 → 1024/2048, we have ~2 GiB headroom;
+   this is an *increase*, not the forbidden decrease). Prediction: it does NOT change
+   V/D (2-token compute is still 2× 1-token compute even with resident experts), so it
+   won't cross 1.0× — but a 10-minute check rules it out.
+4. **Document the negative result** and **do NOT wire S3** (production) on this model.
+   MTP at k=1 is the wrong tool for an on-demand-MoE model. If a decode speedup is
+   required later, the real options are (a) a fused 2-token MoE kernel that shares expert
+   loading (significant kernel investment), or (b) a model/backend where the verify
+   amortizes. The MTP code itself is correct and reusable for such models.
+
+**Recommendation:** keep the (correct) MTP code, fix the snapshot bug, confirm the
+negative result, and record it. Do not proceed to S3 on this model.
+
 ### S3 — Scheduler wiring (size-1 decode batches, `--mtp` gated)
 - **Do:** in the scheduler decode path, when `--mtp` and the batch is a single decode
   request, call `engine.mtp_decode_step` instead of `forward_batch`; extend the commit
