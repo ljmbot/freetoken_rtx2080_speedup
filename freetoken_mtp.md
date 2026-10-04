@@ -88,8 +88,8 @@ The 2.0 GiB prefill transient is the hard constraint from the tuned prefill path
 
 | quantity | value | note |
 |---|---|---|
-| pure decode | **19.9 tok/s** | matches A/B baseline ~18.2 |
-| prefill | 484 tok/s | 24.3× decode ratio |
+| pure decode | **24 tok/s** | live measurement 2026-10-04 (phase0-verify, cutlass/512/64k config; graphs ON) |
+| prefill | 484 tok/s | 20.2× decode ratio |
 | r (2-token verify / 1-token decode) | **1.041** | two-run difference method; true M=2 verify is a lower bound (~1.05–1.1) |
 | alpha (draft acceptance, pre-final-norm wiring) | **0.872** | post-norm wiring 0.830; mis-wired head ≈ chance |
 | VRAM free after engine init | 2.12 GiB | fp16 KV pool already allocated |
@@ -174,7 +174,7 @@ replay = 1, head = ε):
 
   E[cost]   = ε + r + (1−α)·1.0 = 0 + 1.041 + 0.128 = **1.169**
   E[tokens] = 1 + α = **1.872**
-  **projected speedup = 1.872 / 1.169 ≈ 1.60×** → ~32 tok/s from 19.9.
+  **projected speedup = 1.872 / 1.169 ≈ 1.60×** → ~38 tok/s from 24.
 
 The fork's `(1+α)/r = 1.80×` omits the reject-replay cost. **1.6× is the honest
 projection.** The replay may be *cheaper* than 1.0 on the offload path if its
@@ -191,7 +191,7 @@ Confirm the committed baseline is the untouched tuned config before any change.
   `4d5d0fb`, MTP plan is `0e9a013`); confirm `qwen.sh` has the tuned flags
   (cutlass, `--moe-cache-size 512`, `--disable-moe-prefill-overlap`, 64000).
 - Run `qwen.sh` as-is; measure decode + prefill tok/s.
-- **Gate:** decode ≈ 19.9 tok/s, prefill ≈ 484 tok/s, tree clean.
+- **Gate:** decode ≈ 24 tok/s, prefill ≈ 484 tok/s, tree clean.
 - **Stop:** if baseline numbers are off, stop and reconcile first (do not build on
   a moving baseline).
 
@@ -303,7 +303,7 @@ not paged KV — so it can run in parallel with Phase 1 if desired.)
 
 | risk | likelihood | impact | mitigation |
 |---|---|---|---|
-| Q8-KV decode dequant regresses 19.9 tok/s baseline | med | baseline loss | Phase 1 gated + tunable; abort keeps fp16 KV (but then MTP can't fit at 64K) |
+| Q8-KV decode dequant regresses 24 tok/s baseline | med | baseline loss | Phase 1 gated + tunable; abort keeps fp16 KV (but then MTP can't fit at 64K) |
 | GDN chunk-vs-decode numerical divergence breaks token-identity | med | kills MTP | Phase 2 A1 isolates it early; if only low-bit noise, A2 argmax is usually stable — measure, don't assume |
 | replay cost > 1.0 (experts not cached) → speedup < 1.0 | med | MTP doesn't pay off | Phase 5 measures it; if <1.0, stop (honest result) |
 | r higher than 1.041 on the real extend path (proxy was a 2048 prefill) | med | smaller win | Phase 5 measures real verify cost |
@@ -356,6 +356,6 @@ no decode/prefill regression beyond the dequant overhead and no quality regressi
 — hermes gets 64K context with more headroom.
 
 **MTP (Phases 2–5):** `--mtp` on `qwen.sh` gives a **measured** decode speedup ≥
-1.3× over the current 19.9 tok/s baseline, **token-identical** output to greedy,
+1.3× over the current 24 tok/s baseline (i.e. ≥31 tok/s), **token-identical** output to greedy,
 prefill unchanged, and ≥2.0 GiB VRAM headroom preserved at 64K context — all
 reported with real numbers, not projections.
