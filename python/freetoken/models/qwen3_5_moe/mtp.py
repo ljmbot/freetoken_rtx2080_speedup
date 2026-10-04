@@ -95,6 +95,27 @@ def quantize_nvfp4(w_cpu: torch.Tensor, dev: torch.device, chunk: int = 32):
     )
 
 
+def _lm_logits(lm_head, x: torch.Tensor) -> torch.Tensor:
+    """logits for ``x`` via the base model's lm_head, WITHOUT a forward-batch context.
+
+    ``Nvfp4LMHead.forward`` reads ``get_global_ctx().batch`` (to slice prefill
+    last-tokens), but the MTP head drafts OUTSIDE any base forward batch. Call its
+    GEMV/GEMM directly instead. ``ParallelLMHead`` is a plain embedding-indexing
+    ``.forward`` (no ctx), so it is used as-is.
+    """
+    from freetoken.kernel.triton.nvfp4_linear import (
+        Nvfp4LMHead,
+        nvfp4_dense_linear,
+        nvfp4_dense_linear_t,
+    )
+
+    if isinstance(lm_head, Nvfp4LMHead):
+        if getattr(lm_head, "_transposed", False):
+            return nvfp4_dense_linear_t(x, lm_head.weight, lm_head.weight_scale, lm_head.weight_global)
+        return nvfp4_dense_linear(x, lm_head.weight, lm_head.weight_scale, lm_head.weight_global)
+    return lm_head.forward(x)
+
+
 # The 17 non-expert head tensors (the 2 expert tensors are quantized separately).
 _MTP_OTHER_KEYS = [
     "mtp.fc.weight",
@@ -297,14 +318,13 @@ class Qwen3_5MTP(BaseOP):
         ``prev_hidden``). k=1: ``prev_hidden`` is [1, H], ``next_ids`` is [1].
         ``embed_tokens``/``lm_head`` may be callables or modules (``.forward``)."""
         emb = embed_tokens if callable(embed_tokens) else embed_tokens.forward
-        lm = lm_head if callable(lm_head) else lm_head.forward
         e = self.pre_fc_norm_embedding.forward(emb(next_ids))
         h = self.pre_fc_norm_hidden.forward(prev_hidden)
         x = self.fc.forward(torch.cat([e, h], dim=-1))
         x = x + self._attn(self.input_layernorm.forward(x), positions)
         x = x + self._moe(self.post_attention_layernorm.forward(x))
         x = self.norm.forward(x)
-        return lm(x)
+        return _lm_logits(lm_head, x)
 
 
 __all__ = ["Qwen3_5MTP"]

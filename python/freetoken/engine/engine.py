@@ -720,8 +720,7 @@ class Engine:
                 "pass --mtp-head <path> to the 19-tensor mtp_head.safetensors."
             )
         t0 = time.time()
-        with torch.device("meta"), torch_dtype(config.dtype):
-            head = Qwen3_5MTP(config.model_config)
+        head = Qwen3_5MTP(config.model_config)  # CPU build (weights land on GPU in the loader)
         load_mtp_weights(head, head_path, config.dtype, self.device)
         self.mtp_head = head
         torch.cuda.synchronize()
