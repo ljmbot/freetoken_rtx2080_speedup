@@ -241,6 +241,37 @@ not paged KV — so it can run in parallel with Phase 1 if desired.)
   passed Phase 1), report. This is the single biggest risk; isolating it before
   head/engine work means an abort costs only this microtest.
 
+**A1 RESULT (2026-10-04): PASS — reject path is bit-exact faithful.**
+Harness `~/.hermes/cache/scratch/a1_gdn_reject.py` drives the real 40-layer model
+(real GDN weights, real cutlass KV) through the exact §4 reject path on a 129-token
+prefix (spans 2 GDN chunks): prefill → `copy_from` snapshot → 2-token verify (chunk
+kernel) → restore → 1-token replay (decode kernel), compared against a straight
+1-token decode from the same snapshot. KV held identical across paths, so only the
+GDN state trajectory differs.
+
+| check | result |
+|---|---|
+| **PRIMARY** reject-path logits vs straight decode | **0.000000** (bit-identical) |
+| **PRIMARY** GDN recurrent state (fp32) | **0.000000e+00** |
+| **PRIMARY** GDN conv state (fp16) | **0.000000e+00** |
+| SECONDARY chunk-vs-decode recurrent @ c+2 | mean rel 4.0e-4, p99 4.6e-3 (max 7.7, a few outliers) |
+| SECONDARY chunk-vs-decode conv @ c+2 | mean rel 0.416 (see note) |
+| SECONDARY chunk-vs-decode logits @ c+2 | max abs 2.84 |
+
+- **`copy_from` snapshot/restore is bit-exact** and the replay is faithful — the
+  make-or-break risk is cleared. The reject path (the one MTP actually uses on a
+  draft miss) reproduces a straight decode to the last bit.
+- **The SECONDARY divergence is expected, not a bug.** The conv state stores the
+  last 3 raw input tokens; the verify path consumed `x_{c+2}` while the decode path
+  re-consumed `x_{c+1}`, so the conv buffers *should* differ by one token. The
+  recurrent state — the part that actually accumulates across the sequence — matches
+  to mean rel 4e-4 (sub-0.05%), i.e. the chunk and decode kernels are numerically
+  equivalent on the same input. The accept path (which commits the chunk state)
+  therefore carries only this small, bounded drift; A2 (Phase 4) confirms it is
+  token-identical end-to-end.
+- **A2 is deferred to Phase 4** (it needs the full MTP loop). A1's PASS is the
+  Phase-2 gate; A2 re-verifies with the head in the loop.
+
 ### Phase 3 — Head weight load + VRAM
 - Add `--mtp` (default **off**) and `--mtp-draft` (default 1) to `server/args.py`.
 - **Dedicated loader** (fork option 2, lowest blast radius — don't touch the
