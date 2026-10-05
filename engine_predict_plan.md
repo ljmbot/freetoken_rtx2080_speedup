@@ -394,6 +394,33 @@ skewed routing distribution) and/or a cache large enough to hold the per-step un
 Full record + scripts: `~/.hermes/cache/scratch/step5/` (`STEP5_FINDINGS.md`,
 `run_serve.sh`, `workload.py`, `workload_N{1,2,4}.json`).
 
+### Step 6 — RESULTS (cache-size knob measured in the real engine, 2026-10-06)
+
+The 640-slot `--moe-cache-size` in `qwen_q8.sh` was checked: it is **VRAM-bound at the
+64K KV budget, not arbitrary** (git `d153424`: "512->640 (fits 64K chunked prefill; 992
+OOMs)"). Bigger cache = fewer H2D misses, but the VRAM comes from the KV token budget.
+Measured frontier (bs=1, real engine, `--moe-collect-stats`):
+
+| config | fits | miss rate | missing/step/layer | e2e tok/s |
+|---|---|---|---|---|
+| 640 slots @ 64K (production) | yes | 53.0% | 4.24 | 22.2 |
+| **1280 slots @ 64K** | **yes** | **36.0%** | **2.88** | **25.4** |
+| 2048 slots @ 64K | **OOM** | — | — | — |
+| **2048 slots @ 16K** | **yes** | **24.2%** | **1.93** | 24.3 (511 tok) / **35.9** (2047 tok) |
+
+**Verdict — the cache-size knob is the biggest real win found on this project.** Up to a
+55% cut in the per-step copy floor, decode 22.2 → 25.4 tok/s at the full 64K budget
+(1280 slots), or 33–37 tok/s if the workload tolerates 16K context (2048 slots). No code
+change. The router is sticky (implied expert working set grows with cache: 339 experts at
+640 slots, 496 at 2048), so the LRU catches recurring experts as the cache holds more
+history. It is a **KV-vs-cache trade at 8 GB** (per 1024 extra slots = +1.81 GB).
+Ship 1280 @ 64K (safe, full context) or 2048 @ 16K (max decode, if context allows).
+Phase 4 (CPU co-compute) remains open, but its motivation (copy floor) just dropped up to
+55% — re-evaluate before starting the multi-week C++ path.
+
+Full record + scripts: `~/.hermes/cache/scratch/step5/CACHE_SIZE_FINDINGS.md`,
+`run_serve_cache.sh CACHE TOKS`.
+
 ---
 
 ## 7. Risks / open questions
@@ -426,10 +453,14 @@ Full record + scripts: `~/.hermes/cache/scratch/step5/` (`STEP5_FINDINGS.md`,
   closed dead with real numbers**; the structural win is Phase 5 (batching).
 - **Q3:** the demand path is not doing unnecessary fetches — it copies only misses, with
   near-optimal LRU eviction. The only waste is the prefetch's 22 % wrong-prediction bytes.
-- **Next action (updated 2026-10-05):** Phase 2 (prefetch) **closed** (Step 2) and
+- **Next action (updated 2026-10-06):** Phase 2 (prefetch) **closed** (Step 2) and
   Phase 5 (batching) **closed** (Step 5) — both measured dead in the real engine. All
   three decode-side structural levers (prefetch / prefill warm start / batching) are now
-  closed with real numbers. Remaining: **Phase 4 (CPU co-compute)** — the multi-week C++
-  path that removes bytes from the link entirely — and a quick check of whether the
-  640-slot cache cap is VRAM-bound or a config choice (a larger cache directly cuts the
-  bs=1 copy floor: 53% miss at 640 slots).
+  closed with real numbers. **The win is the `--moe-cache-size` knob** (Step 6): the
+  640-slot cap was VRAM-bound at the 64K KV budget, not arbitrary. Measured frontier —
+  640 slots @ 64K (22.2 tok/s, 53% miss) → **1280 slots @ 64K (25.4 tok/s, 36% miss)** →
+  **2048 slots @ 16K (33–37 tok/s, 24% miss)**; 2048 @ 64K OOMs. It's a KV-vs-cache
+  trade at 8 GB. Ship 1280 @ 64K (safe, full context) or 2048 @ 16K (max decode, if
+  context allows). Remaining: **Phase 4 (CPU co-compute)** — still open, but the copy
+  floor just dropped up to 55%, so re-evaluate whether the multi-week C++ path is worth
+  it before starting.
