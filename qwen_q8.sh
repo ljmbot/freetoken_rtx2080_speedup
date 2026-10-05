@@ -16,7 +16,7 @@ exec ft serve \
  --moe-backend offload \
  --nvfp4-backend triton \
  --expert-load serial \
- --moe-cache-size 512 \
+ --moe-cache-size 640 \
  --disable-moe-prefill-overlap \
  --memory-ratio 0.95 \
  --num-tokens 64000 \
