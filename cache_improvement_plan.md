@@ -11,8 +11,10 @@ tok/s). Phase 2 (the read-ahead — both the YALIS/Strata next-layer *prefetch* 
 *prediction-guided eviction* pivot) **closed negative** with measurements: the real 3-layer
 prototype shows prefetch is a net loss (k=0 baseline beats every k>0, 0.96×→0.84×), and the
 router prediction is an intra-token signal that can't drive eviction (+1.5 pts honest, below
-gate). LRU is near-optimal at 640 slots. Remaining wins: Phase 3 (static warm start,
-cheap/optional) and Phase 5 (batching, the structural win that scales — separate project, S6).
+gate). LRU is near-optimal at 640 slots. Phase 3 (static warm start) **closed no-op**: the
+cold-start deficit is ~zero (LRU converges in ~10 tokens) and prefill doesn't warm the decode
+cache anyway (only the last layer survives `materialize_layer` eviction). Remaining win:
+Phase 5 (batching, the structural win that scales — separate project, S6).
 
 **One-sentence diagnosis.** Decode is PCIe-bandwidth-bound on streaming expert weights
 CPU→GPU (one CUDA C++ kernel, `fast_index_copy_multi`). The LRU expert cache *already*
@@ -301,8 +303,8 @@ LRU→Belady gap is real but requires true future knowledge no available signal 
 LRU is near-optimal among implementable policies. The read-ahead idea (the user's original
 hypothesis) does not pay off on sm75 + saturated-PCIe + this model — now **measured
 directly** (G2.7 prototype: k=0 baseline beats every k>0), not just argued. **Phase 2
-closed negative.** The structural win that scales is **Phase 5 (batching)**; the cheap
-optional win is **Phase 3 (static warm start)**.
+closed negative.** The structural win that scales is **Phase 5 (batching)**; Phase 3
+(static warm start) is closed no-op (see §4 Phase 3).
 
 <details><summary>Superseded design (prefetch) — kept for the record</summary>
 
@@ -315,17 +317,52 @@ adds spurious bytes to a PCIe link already pegged by the demand copy, so there i
 compute window to hide them under. Superseded.
 </details>
 
-### Phase 3 — Static expert-profile warm start (Strata-style). OPTIONAL, cheap
-Preload the 640-slot cache with the **hottest experts for the user's actual workload**
-(C/Java coding, bug hunts, docs-from-C) *before* the first token, instead of starting cold.
-- Build the profile by running the engine once over representative prompts with
-  `--dump-routing`-style capture (we already have the routing recorder, `s2_route_record.py`),
-  rank the (layer,expert) pairs by frequency, and seed the cache at startup.
-- **No accuracy impact** (static, no routing change). Raises the *early-token* hit rate
-  (cold start is the worst case for LRU). Complements Phase 2 (warm start + prefetch).
-- **Gate:** measure hit rate over the first N tokens with vs without the profile; accept if
-  it raises the first-100-token hit rate by ≥ 5 pts without hurting steady state.
-- **Rollback:** behind `--moe-profile <path>` (default off / no file = current behavior).
+### Phase 3 — Static expert-profile warm start (Strata-style). ❌ CLOSED NO-OP (2026-10-05)
+
+**Conclusion: not worth doing — the cold-start deficit is ~zero, and the premise that
+prefill warms the decode cache is wrong for the production config.** Two independent
+findings (both measured, 2026-10-05):
+
+**1. The cold-start deficit is ~zero (LRU sim on the real capture).** A pure-LRU
+simulation on the recorded routing (16 slots/layer, 40 layers, 1600 tokens) shows hit
+rate flat at **~46.7% from the very first token** — no ramp-up, no cold-start penalty:
+
+| window | hit rate |
+|---|---|
+| [0,100) | 46.8% |
+| [100,200) | 46.5% |
+| [200,400) | 46.7% |
+| [400,600) | 46.8% |
+| steady (t≥200) | 46.6% |
+
+LRU converges within ~10 tokens. There is no "first request is slow" effect to fix.
+
+**2. Prefill does NOT warm the decode cache (production path).** An earlier session
+hypothesized that the first request's prefill (up to 4096 tokens) "very likely warms the
+slot cache before decode begins." That is **wrong for the production config**. Verified
+empirically against the real kernels (`scratch/p3_prefill_warm_test.py`,
+`scratch/p3_prod_geo.py`):
+
+- Production runs `--disable-moe-prefill-overlap` (`qwen_q8.sh`), so prefill uses
+  `materialize_layer` (synchronous full-layer H2D into the first `num_experts` slots),
+  **not** the double-buffer overlap path.
+- `materialize_layer` writes the LRU map as a *contiguous* `slot = expert_id` for the
+  whole layer, then the **next** `materialize_layer` (next layer) **evicts** the previous
+  layer's entries (they share the same slot range). So after a full prefill, only the
+  **last** layer's map survives.
+- At production geometry (L=40, E=256, S=640): after a full prefill, **only layer 39 is
+  warm — 256/10240 (layer,expert) pairs = 2.5% of the decode address space; 39 of 40
+  layers are cold** for the first decode token.
+
+So the decode cache is effectively cold after prefill (worse than the "warm" hypothesis),
+but finding 1 shows that doesn't matter: LRU converges in ~10 tokens, so the cold-start
+deficit is ~zero. A static warm start would buy ~nothing (no ≥5-pt early-token gain, the
+Phase-3 gate), and it's the only remaining "cheap" lever — so it's closed as a no-op, not
+deferred.
+
+*(Superseded design — kept for the record)* Preload the 640-slot cache with the hottest
+experts for the user's workload before the first token, behind `--moe-profile <path>`.
+Gate was ≥5-pt first-100-token hit-rate gain; not met (LRU is already ~46.7% at t=0).
 
 ### Phase 4 — CPU co-computation of misses (the "Strata way"). ⚠️ OUT OF SCOPE (noted)
 Strata's biggest lever — compute missed experts on the CPU (AVX-512/AVX2 ggml) in parallel
@@ -459,8 +496,11 @@ as S6. Not part of this plan.
 - **Strata's 60–70% is mostly bigger-cache + warm-profile + CPU co-compute** — none of
   which fit here (no VRAM headroom for a bigger cache; CPU co-compute is out of scope).
   The transferable prefetch does not help on a copy-dominated link.
-- **What's left that actually pays:** Phase 3 (static warm start — cheap, optional,
-  raises early-token hit rate) and Phase 5 (batching — the structural win that scales
-  past the single-request PCIe ceiling; separate project, tracked as S6).
+- **What's left that actually pays:** Phase 5 (batching — the structural win that scales
+  past the single-request PCIe ceiling; separate project, tracked as S6). Phase 3 (static
+  warm start) is CLOSED NO-OP: the cold-start deficit is ~zero (LRU converges in ~10
+  tokens) and prefill doesn't warm the decode cache anyway (only the last layer survives
+  `materialize_layer` eviction), so a warm start would buy ~nothing.
 - **Phased, gated, rollback-safe, accuracy-reviewed.** Phase 1 shipped (640 cache);
-  Phase 2 closed negative; Phase 3 is the only remaining quick win.
+  Phase 2 closed negative; Phase 3 closed no-op. The per-request levers are exhausted;
+  batching (Phase 5) is the only remaining structural win.
