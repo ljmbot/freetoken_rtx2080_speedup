@@ -234,43 +234,68 @@ architectural change (C++ CPU ggml kernels) for a PyTorch engine — noted, not 
 `qwen_q8.sh` `--moe-cache-size 512 → 640`. +1–2 tok/s (4–8%). Max that fits the 64K
 chunked-prefill peak (~200 MiB spare). No further cache-size headroom (992 OOMs). Done.
 
-### Phase 2 — Next-layer routing prefetch + double-buffered async copy streams. ⭐ TOP PRIORITY
-The YALIS/Strata technique, the real read-ahead. **Ceiling 1.545× (39.7 → 25.7 ms/tok).**
+### Phase 2 — Prediction-guided cache eviction. ⭐ TOP PRIORITY (pivoted 2026-10-05)
 
-**Design (YALIS Algorithm 1, `wait-and-prefetch`):**
-1. Move the expert copy **off the compute stream** onto a dedicated **copy stream**,
-   non-blocking, with **double-buffered** GPU expert slots (so the prefetch never clobbers
-   the in-use slot).
-2. For layer *l*: after the router emits `topk_ids(l)`, issue an **async** copy of layer
-   *l*'s experts on the copy stream; **don't block** the compute stream.
-3. **While layer *l*'s GEMV runs**, run **layer *l+1*'s router** on layer *l*'s hidden state
-   (~0.02 ms per layer; the full 40-layer router is 0.63 ms/iter in the kernel dump) to
-   predict `topk_ids(l+1)`, and **issue the async copy** of layer *l+1*'s predicted experts
-   (in flight while *l* computes).
-4. Before layer *l*'s GEMV, `compute_stream.wait_stream(copy_stream)` for layer *l*'s copy.
-   Steady state: each layer's GEMV (0.35 ms) overlaps the next layer's copy (0.64 ms); the
-   copy is the bottleneck → total ≈ 25.7 ms.
+**The pivot (measured):** The original Phase 2 (next-layer *prefetch* + double-buffered copy
+streams) is **dead on this hardware**, and the router prediction — the same signal G2.2
+measured — is worth far more as an **eviction policy** than as a prefetch trigger.
 
-**Gates (must pass before production wiring):**
-- **G2.1 Overlap fraction:** measure achieved ms/tok with prefetch on a small harness.
-  Accept if **≥ 1.10×** (i.e. ≤ ~36 ms/tok). Reject if < 1.05× (overlap not holding on sm75).
-- **G2.2 Prediction recall:** on the recorded routing stream, measure the next-layer
-  router-prediction recall@8 (how many of layer *l+1*'s true top-8 are in the predicted
-  top-8 issued during *l*). YALIS expects high recall on Qwen3-30B-A3B; confirm on ours.
-  (Low recall still gives *some* overlap benefit but less; it also means more wasted
-  prefetch bytes — check the copy engine isn't saturated by wasted traffic.)
-- **G2.3 No accuracy change:** token-identical to the non-prefetch path (the prediction only
-  prefetches; true routing is unchanged — see §5).
-- **G2.4 VRAM:** double-buffering adds one extra expert-slot buffer. Must stay within the
-  ~436 MiB headroom (one buffer ≈ tens of MiB — 8 experts × ~1.77 MB × 2 ≈ 28 MB per layer
-  pair — verify it fits; if not, single-buffer with careful slot juggling, or reduce to
-  per-layer-group double buffering).
+**Why prefetch loses here.** The PCIe link is **saturated** (copy 25–34 ms/tok ≫ compute
+10 ms/tok). Overlap can only reach `max(copy, compute) = copy time` (G2.1 confirmed the
+mechanism, 92–95% overlap — but overlap hides *compute* under *copy*, and copy is the
+bottleneck). Speculative prefetch **adds bytes** to a saturated link: prefetch 8 rows/layer
++ ~1.8 demand misses ≈ **2.3× the 4.3 demand-only misses** (21.9% of prefetch is wasted
+predictions, G2.2). More bytes on a pegged wire = slower. Prefetch only pays off on a
+*non*-saturated link (copy < compute); ours is the opposite. **Do not build it.**
 
-**Rollback:** behind `--moe-prefetch` (default off). Off = current synchronous
-`fast_index_copy_multi` path, byte-for-byte.
+**The lever that removes bytes is hit rate.** Sim (`s2_evict_sim.py`, 1600 tokens × 40
+layers × 16 slots/layer = the 640-slot cache):
 
-**Effort:** medium-high (CUDA stream rework of the copy path + router lookahead + double
-buffering + the wait-and-prefetch context manager). This is the main project.
+| policy | hit rate | ~ms/tok (model) |
+|---|---|---|
+| LRU (current) | 46.7% | 35.5 |
+| **realpred (predicted-next-use eviction)** | **58.9%** | **27.8** |
+| Belady oracle (true future) | 58.6% | 28.1 |
+
+`realpred` = evict the resident expert whose **predicted** next use (from the router
+prediction stream, predictions made at steps ≤ t) is farthest; tie-break by LRU recency.
+It **matches the Belady oracle** — the 78% router prediction (G2.2) is a good-enough
+1-step-ahead signal to drive near-optimal eviction. **+12.2 hit-rate points, zero extra
+PCIe bytes, zero stream rework, zero double-buffering.** Model estimate **~1.28×** on the
+copy-bound decode (35.5 → 27.8 ms/tok); the A/B harness is the arbiter.
+
+**Design:**
+1. Per layer, per decode step, compute `topk(gate(l), hidden(l-1))` (the prediction we
+   already validated in G2.2 — a small matmul, ~0.02 ms/layer, ~0.8 ms/token, inside the
+   compute budget). Maintain a rolling window of recent predictions per layer.
+2. In the cache's eviction path, replace the LRU victim pick with `realpred`: victim =
+   resident expert with the farthest predicted next use (∞ if never predicted), tie-break
+   LRU. Keep LRU as the fallback when the prediction window is empty (prefill, first tokens).
+3. No change to which experts are *computed* — only which cached slot is *evicted*.
+
+**Gates:**
+- **G2.3 No accuracy change (by construction):** eviction never changes the computed expert
+  set — the true router still decides what runs. Token-identical to the LRU path over the
+  A/B harness (greedy, temp 0). Any divergence = stop.
+- **G2.5 End-to-end speed:** A/B harness ms/tok ≥ **1.10×** vs LRU at cache 640. The sim
+  predicts ~1.28×; accept ≥ 1.10×, investigate < 1.05× (prediction window too short /
+  prediction cost eating the gain).
+- **G2.4 VRAM:** eviction adds only a small per-layer prediction buffer (int ids, ~KB) —
+  no expert-slot growth. No headroom risk.
+
+**Effort:** low-medium. A victim-selection change in `offload_cache.py`'s eviction path + a
+per-layer prediction buffer fed from the existing gate. No CUDA stream rework.
+
+**Rollback:** behind `--moe-evict pred|lru` (default `lru` = current behavior, byte-for-byte).
+
+<details><summary>Original Phase 2 (prefetch) — superseded, kept for the record</summary>
+
+The YALIS/Strata `wait-and-prefetch` read-ahead: move the expert copy onto a dedicated copy
+stream, double-buffer GPU slots, run layer *l+1*'s router during layer *l*'s GEMV to prefetch
+*l+1*'s predicted experts. Ceiling 1.545× **assumed a non-saturated link**. G2.1 (overlap
+mechanism, 92–95%) and G2.2 (recall@8 78.1%) both PASSED, but the saturation analysis above
+shows prefetch *adds* bytes to a pegged wire → net loss. Superseded by the eviction policy.
+</details>
 
 ### Phase 3 — Static expert-profile warm start (Strata-style). OPTIONAL, cheap
 Preload the 640-slot cache with the **hottest experts for the user's actual workload**
