@@ -406,6 +406,11 @@ as S6. Not part of this plan.
   window to hide them under (prefetch and demand share the link). This confirms the
   corrected byte accounting (§3 note, §4 Phase 2a) and closes the residual uncertainty
   from G2.1. No k clears the 1.10× gate; nothing to scale to 40 layers.
+  *(Caveat: G2.7's "compute" was a proxy — `torch.bmm` GEMVs at 0.26 ms/layer, matching
+  production MoE GEMV timing — not the full engine; the copy side was the real
+  `fast_index_copy_multi` kernel over real PCIe. The full-engine A/B (token-identical +
+  ms/tok) is deferred; the 3-layer result + corrected byte accounting is sufficient to
+  close Phase 2 negative. Revisit if a full-engine confirmation is wanted.)*
 
 1. **Confirm bandwidth saturation directly** (not inferred): a microbenchmark that streams a
    known byte count CPU→GPU at cache 640 and reports effective GB/s. Expect ~13–16 GB/s
