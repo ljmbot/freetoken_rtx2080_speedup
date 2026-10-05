@@ -313,8 +313,12 @@ class OffloadMoELayer(MoELayer):
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
+        # Effective-prefetch-window probe (measurement only; FREETOKEN_MOE_PF_PROBE=1).
+        # Fork a 1-expert H2D copy to run CONCURRENTLY with the demand copy below, then
+        # join after the GEMM. No-op when the probe is disabled.
+        cache._pf_probe_begin(self.layer_id)
         cache.copy_missing()
-        return self._expert_gemm(
+        out = self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
@@ -324,6 +328,8 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+        cache._pf_probe_join()
+        return out
 
     def _decode_hybrid(
         self,

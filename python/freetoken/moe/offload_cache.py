@@ -257,6 +257,12 @@ class OffloadMoeCache:
         self._prefill_hit_d2d_active = False
         self._hit_d2d_fallback_logged = False
         self._batch_memcpy = None
+        # Effective-prefetch-window probe (measurement only; FREETOKEN_MOE_PF_PROBE=1).
+        # A concurrent H2D copy of one real expert on a second stream, enqueued at the
+        # start of each layer's MoE (right after the demand copy) so it overlaps the
+        # layer's GEMM + attention + the next layer's demand copy -- the real window a
+        # prefetch would get. nsys reads its duration + demand-overlap. None when off.
+        self._pf_probe = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
 
@@ -314,6 +320,92 @@ class OffloadMoeCache:
         self._build_copy_plan()
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
+        if os.getenv("FREETOKEN_MOE_PF_PROBE", "").strip().lower() in {"1", "true", "yes", "on"}:
+            self._setup_pf_probe()
+
+    def _setup_pf_probe(self) -> None:
+        """Allocate the effective-prefetch-window probe (measurement only).
+
+        A dedicated scratch buffer (one expert per bank) + a second CUDA stream + a
+        sync event. ``_enqueue_pf_probe`` copies one real expert (all banks) from the
+        pinned host source into the scratch on the probe stream, so nsys can read its
+        real duration while it runs concurrently with the demand copy + GEMM. The
+        scratch is disjoint from the slot cache, so the demand path and the probe never
+        race on the same bytes (a correctness property the real prefetch also needs).
+        """
+        if self.device.type != "cuda" or not self.banks:
+            return
+        scratch = []
+        dst_ptrs, feats = [], []
+        for name in self.bank_schema:
+            head = self.bank_sources[name][0]
+            buf = torch.empty((1, *head.shape[1:]), dtype=head.dtype, device=self.device)
+            scratch.append(buf)
+            if buf.data_ptr() % 16 != 0:
+                continue
+            dst_ptrs.append(buf.data_ptr())
+            feats.append(math.prod(head.shape[1:]) * head.element_size())
+        # Reuse the demand copy's source pointers + per-row bytes (same kernel, same
+        # expert geometry). dst is the scratch; the probe copies expert 0 of each layer.
+        self._pf_probe = {
+            "scratch": scratch,
+            "dst_ptrs": torch.tensor(dst_ptrs, dtype=torch.int64, device=self.device),
+            "feat_bytes": torch.tensor(feats, dtype=torch.int64, device=self.device),
+            "stream": torch.cuda.Stream(device=self.device),
+            "event": torch.cuda.Event(),
+            "src_idx": torch.tensor([0], dtype=torch.int32, device=self.device),
+            "num_idx": torch.tensor([1], dtype=torch.int64, device=self.device),
+        }
+        logger.info_rank0(
+            f"MoE prefetch-window probe ENABLED ({len(scratch)} banks, "
+            f"{[int(f) for f in feats]} B/bank)"
+        )
+
+    def _pf_probe_begin(self, layer_id: int) -> None:
+        """Fork the probe copy to run CONCURRENTLY with this layer's demand copy.
+
+        Called right before ``copy_missing`` (at the start of the layer's MoE). The
+        probe stream is synced to the main stream at this point, then a 1-expert H2D
+        copy (all banks, real pinned source, same kernel/geometry as the demand copy)
+        is enqueued on the probe stream -- so it competes for the PCIe link with the
+        demand copy that runs immediately after on the main stream. This mirrors the
+        G2.7 prefetch choreography (prefetch enqueued at the start of the layer's MoE,
+        overlapping the demand copy). The scratch dst is disjoint from the slot cache,
+        so no data race. Graph-safe: no host sync, fixed shapes, re-evaluated at replay.
+        """
+        probe = self._pf_probe
+        if probe is None:
+            return
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+        stream = probe["stream"]
+        ev = probe["event"]
+        ev.record(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(stream):
+            stream.wait_event(ev)
+            fast_index_copy_multi_jit(
+                probe["dst_ptrs"],
+                self._copy_src_ptrs[layer_id],
+                probe["feat_bytes"],
+                probe["src_idx"],
+                probe["src_idx"],
+                probe["num_idx"],
+            )
+
+    def _pf_probe_join(self) -> None:
+        """Join the probe stream back to the main stream (graph-capture safety).
+
+        Called after the layer's GEMM. The main stream waits for the probe copy to
+        finish. If the probe finished within the window (GEMM + attention), this is a
+        no-op (no stall); if the window was too small, this is the stall the plan warns
+        about -- exactly the failure mode being measured.
+        """
+        probe = self._pf_probe
+        if probe is None:
+            return
+        ev = probe["event"]
+        ev.record(probe["stream"])
+        torch.cuda.current_stream(self.device).wait_event(ev)
 
     def _build_copy_plan(self) -> None:
         """Precompute the fused multi-bank copy descriptor (base addrs + per-row bytes).

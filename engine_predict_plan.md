@@ -300,6 +300,44 @@ window, and link sharing between the demand copy and the prefetch). If the effec
 the full MoE window (ratio 1.38), the prefetch is viable; if it is only the GEMM window
 (ratio 0.38), close Phase 2 with the real numbers.
 
+### Step 2 — RESULTS (effective window measured in the real engine, 2026-10-05)
+
+The window ambiguity is **resolved**, and both Step 1 hypotheses were wrong. Measured by
+running a real concurrent prefetch probe in the real decode path (a 1-expert H2D copy,
+same `fast_index_copy_multi` kernel + 1.77 MB geometry + pinned source, on a second
+stream, enqueued at the start of each layer's MoE so it runs **concurrently with the
+demand copy** — the G2.7 choreography; dst in a disjoint scratch buffer; graph-captured).
+Full record + probe code in `~/.hermes/cache/scratch/step2/` (`STEP2_FINDINGS.md`).
+
+| quantity | alone (Step 1) | concurrent (Step 2) |
+|---|---|---|
+| demand copy (4.18 experts) | 590 µs | **740 µs** (+150 µs) |
+| probe (1 expert, 1.77 MB) | 141 µs | **401 µs** (2.8× slower) |
+
+- **97.8%** of probe copies overlap the concurrent demand copy — the prefetch runs
+  **during the demand copy window, not the GEMM window**. 90% finish inside it; 10% spill.
+- **The link is pegged: the probe extends the demand copy by exactly its own byte count**
+  (590 + 1.77 MB/12.5 GB/s = 732 µs predicted; 740 µs observed). The demand copy's
+  over-provisioned threads win link arbitration, so the probe runs at ~3.7 GB/s, not 12.5.
+- **Net cost of a 1-expert prefetch (right prediction): +9 µs (slower).** At 78% recall:
+  **+40 µs/layer (slower)**. e2e: 19.4 tok/s (probe) vs 23.0 (baseline).
+
+**Verdict — Phase 2 prefetch is structurally dead, for a stronger reason than G2.7.**
+Neither the "full MoE window (1.38, viable)" nor the "GEMM-only window (0.38, dead)"
+hypothesis holds: the prefetch does **not** get a free window. On a **pegged link**,
+prefetching an expert into an already-saturated window is a **no-op for total bytes and
+pure latency** — it fetches bytes the demand copy would have fetched anyway (Q3: no
+redundancy to eliminate), so it **cannot reduce the 61.4% copy duty cycle**; it only adds
+latency, and the 22% wrong-prediction bytes are strictly negative. A better predictor
+(recall caps at 78%) or better eviction (LRU near-optimal) cannot fix this. This is a
+**harder** dead-end than G2.7's "GEMM window < expert copy": even an arbitrarily large
+GEMM window would not help a concurrent prefetch on a pegged link with no redundant
+bytes.
+
+**The only structural escape is Phase 5 (batching)** — amortize one expert fetch across
+N concurrent requests, which **does** reduce total H2D bytes per token. That is the real
+win. **Close Phase 2 (prefetch) with these real numbers; point the plan at Phase 5.**
+
 ### Step 2 — Corrected prefetch in the real engine (only if ratio ≥ 1.0). ~2–3 days.
 Integrate the Section 3 design behind `--moe-prefetch-k <k>` (default 0 = today):
 - Create one **copy stream** at graph capture; enqueue the next-layer prefetch at the start
@@ -347,11 +385,14 @@ multi-request work as a separate project (S6). This does not depend on the prefe
   (the GEMM, attention, GDN, and norm kernels), not just the GEMM windows. Step 1 also
   measures peak link utilization (GB/s) directly, to confirm "saturated" is a floor and not
   a tunable.
-- **Q2:** compute *is* the only free window, and the G2.7 prototype did target it — but it
-  lost because the window (0.262 ms synthetic) < one expert copy (0.315 ms), so the prefetch
-  spills and the safe wait stalls. **Whether that holds in the real engine is the one
-  unmeasured fact.** Step 1 measures it.
+- **Q2:** compute *is* the only free window, and the G2.7 prototype did target it — but
+  Step 2 (real engine) shows the prefetch **doesn't get a free window at all**: on the
+  pegged link it runs concurrently with the demand copy and extends it by its own byte
+  count (net +9 µs right / +40 µs/layer at 78% recall — slower). **Phase 2 prefetch is
+  closed dead with real numbers**; the structural win is Phase 5 (batching).
 - **Q3:** the demand path is not doing unnecessary fetches — it copies only misses, with
   near-optimal LRU eviction. The only waste is the prefetch's 22 % wrong-prediction bytes.
-- **Next action:** Step 1 (measure the real GEMM/copy ratio in the production engine). No
-  engine change until that verdict lands.
+- **Next action:** Phase 2 (prefetch) is **closed** (Step 2, real-engine, 2026-10-05).
+  The per-request decode bottleneck is the pegged PCIe link with no redundant bytes to
+  eliminate — the only structural win is **Phase 5 (batching)**, which amortizes one
+  expert fetch across N concurrent requests and *does* reduce total H2D bytes per token.
