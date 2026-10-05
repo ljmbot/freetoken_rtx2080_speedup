@@ -411,6 +411,43 @@ GPU), and against a graphed baseline that step is 2.18× the baseline token cost
   eager path. Do NOT wire it into production (S3). It would only win in a regime where
   the baseline is ALSO eager and GPU-bound (big batch / no graph) — not this deployment.
 
+### S2 final decode profile (2026-10-05) — the "thundering herd" is ONE kernel: PCIe expert streaming
+
+Full kernel dump of the GRAPHED decode (`s2_full_dump.py`, 30 iters, cache 640):
+  - **`fast_index_copy_multi` (CUDA): 25.7 ms/iter = 65%** — the fused multi-bank copy
+    streaming on-demand expert weights CPU→GPU over PCIe. This is the whole story.
+  - `_gemv_splitk` 4.1 ms (10%) + `_decode_nvfp4_marlin` 3.8 ms (10%) — MoE GEMV compute.
+  - GDN decode (fused_sigmoid_gating_delta_rule_update + causal_conv1d + layer_norm): ~0.6 ms.
+  - Router (gatherTopK + bitonicSort + softmax_warp): ~0.6 ms (1.4%).
+  - All elementwise/norm/copy combined: ~2 ms. NOT a herd — my earlier "31 ms elementwise"
+    bucket was a categorizer bug that swept `fast_index_copy_multi` into "copy".
+
+**Decisive ablation (`s2_pc_test.py`, FREETOKEN_SKIP_FAST_INDEX_COPY=1 makes the copy free):**
+  - normal (PCIe streaming): **39.7 ms/tok** (25.2 tok/s)
+  - copy free ("experts resident" upper bound): **14.0 ms/tok** (71.3 tok/s)
+  → PCIe expert streaming is **25.7 ms/tok (65%)** of the graphed decode.
+
+**Answer to "is it Python vs C++?": NO.** The slow kernel is already hand-written CUDA C++
+(`kernel/csrc/jit/fast_index_copy.cuh`, JIT-compiled). It is **PCIe-bandwidth-bound**
+(~0.8 GB/tok of expert weights at ~19–31 GB/s effective over PCIe 3.0 x16) — a physical
+link limit no rewrite can beat. The decode is a serial dependency chain
+(router(i)→fetch(i)→GEMV(i)→router(i+1)→…) so the fetch cannot overlap the next layer's
+compute, and the next token's experts are unknowable before its forward (same
+chicken-and-egg as the MTP cold-skip question).
+
+**Why the LRU cache can't hold the working set:** a token touches 8 experts/layer × 40
+layers = 320 (layer,expert) pairs; over a few dozen tokens the per-layer working set
+approaches all 256 experts, i.e. up to 10240 pairs. The GPU cache holds 640 slots (6%).
+Full residency would need 256×40×1.5 MB ≈ **15 GB of expert weights — impossible on an
+8 GB card**. So 640 slots (the max that fits 64K context + prefill peak) is the ceiling.
+
+**Conclusion: ~25–27 tok/s is near the practical ceiling for this model on this card.**
+The MoE-offload design (CPU experts, PCIe streaming) is the binding constraint. Levers,
+ranked: (a) bigger cache — VRAM-capped at 640 (992 OOMs; measured); (b) overlap — not
+possible in single-request decode; (c) batching (S6) — amortizes each fetch across
+requests, the only structural win, deferred; (d) rewrite the copy kernel — no gain
+(bandwidth-bound, already C++).
+
 ### S3 — Scheduler wiring (size-1 decode batches, `--mtp` gated)
 - **Do:** in the scheduler decode path, when `--mtp` and the batch is a single decode
   request, call `engine.mtp_decode_step` instead of `forward_batch`; extend the commit
