@@ -8,11 +8,11 @@ invariants.
 
 **Status (2026-10-05): investigation complete.** Phase 1 (640-slot cache) shipped (+1–2
 tok/s). Phase 2 (the read-ahead — both the YALIS/Strata next-layer *prefetch* and the
-*prediction-guided eviction* pivot) **closed negative** with measurements: prefetch adds
-bytes to a copy-dominated link (net loss), and the router prediction is an intra-token
-signal that can't drive eviction (+1.5 pts honest, below gate). LRU is near-optimal at
-640 slots. Remaining wins: Phase 3 (static warm start, cheap/optional) and Phase 5
-(batching, the structural win that scales — separate project, S6).
+*prediction-guided eviction* pivot) **closed negative** with measurements: the real 3-layer
+prototype shows prefetch is a net loss (k=0 baseline beats every k>0, 0.96×→0.84×), and the
+router prediction is an intra-token signal that can't drive eviction (+1.5 pts honest, below
+gate). LRU is near-optimal at 640 slots. Remaining wins: Phase 3 (static warm start,
+cheap/optional) and Phase 5 (batching, the structural win that scales — separate project, S6).
 
 **One-sentence diagnosis.** Decode is PCIe-bandwidth-bound on streaming expert weights
 CPU→GPU (one CUDA C++ kernel, `fast_index_copy_multi`). The LRU expert cache *already*
@@ -159,11 +159,15 @@ measure (Phase 2 gate).
 
 > **⚠️ Post-hoc correction (2026-10-05, §4 Phase 2 closed negative):** the arithmetic above
 > holds `copy = 25.7 ms` constant while overlapping — but the overlap *requires* the
-> prefetch, and the prefetch **adds bytes** (21.9% wasted predictions + full 8-row prefetch
-> vs ~4.3 demand misses ≈ 2.3× miss traffic). On a copy-dominated link the copy time grows
-> with the extra bytes, eating the 14.0 ms of hidden compute. The 1.545× ceiling is only
-> reachable when the link has spare bandwidth (YALIS's A6000 regime); on our
-> copy-dominated sm75 link it is not. See §4 Phase 2 for the full closure.
+> prefetch, and the prefetch **adds bytes** to the link. *(The original draft here said
+> "2.3× miss traffic" — that double-counted: the prefetch's useful fetches are the demand
+> misses moved earlier, so they cancel. The only genuinely new bytes are the spurious
+> predictions. Corrected: total ≈ 6.0 rows/layer vs 4.3 baseline, i.e. +1.75 spurious/layer.)*
+> On a copy-dominated link the copy time grows with those extra bytes, eating the 14.0 ms
+> of hidden compute. The 1.545× ceiling is only reachable when the link has spare
+> bandwidth (YALIS's A6000 regime); on our copy-dominated sm75 link it is not. **The real
+> 3-layer prototype (G2.7, §6) confirmed this directly: k=0 baseline beats every k>0.**
+> See §4 Phase 2 for the full closure.
 
 ---
 
@@ -256,15 +260,20 @@ chunked-prefill peak (~200 MiB spare). No further cache-size headroom (992 OOMs)
 Both forms of the YALIS/Strata read-ahead were investigated and **closed negative on this
 hardware**. This is a measured result, not a deferral.
 
-**(a) Next-layer prefetch (original design) — net loss.** The PCIe link is copy-dominated
-(copy 25–34 ms/tok ≫ compute 10 ms/tok). G2.1 confirmed the *overlap mechanism* works
-(92–95% on sm75) and G2.2 confirmed the *prediction* is strong (recall@8 78.1%), but the
-prefetch **adds bytes** to a copy-dominated link: prefetch 8 rows/layer + ~1.8 demand
-misses ≈ **2.3× the 4.3 demand-only misses** (21.9% wasted). The only overlap win (hiding
-compute under copy) *requires* the prefetch, and the prefetch adds more copy time than the
-compute it hides. Net loss. *(Residual uncertainty: G2.1 used a single 18.9 MB copy; the
-real decode does many small copies that may leave link headroom. Resolvable only by the
-real-loop prototype — not worth it given (b).)*
+**(a) Next-layer prefetch (original design) — net loss, MEASURED.** The PCIe link is
+copy-dominated (copy 25–34 ms/tok ≫ compute 10 ms/tok). G2.1 confirmed the *overlap
+mechanism* works (92–95% on sm75) and G2.2 confirmed the *prediction* is strong
+(recall@8 78.1%), and the **real 3-layer prototype (G2.7, §6) measured the net effect
+directly: prefetch loses at every k** (k=0 baseline 1.67 ms/layer; k=1 0.96×, k=4 0.93×,
+k=8 0.84×). The reason is the byte accounting, corrected from the original "2.3×" claim
+which double-counted: the prefetch's *useful* fetches are the demand misses moved earlier
+(they cancel out of the total), so the only genuinely new bytes are the **spurious
+predictions** (predicted but not actually routed). Total ≈ 6.0 rows/layer vs 4.3 baseline
+(+1.75 spurious/layer). On a copy-dominated link those extra bytes grow the copy time and
+eat the ~14 ms of compute the overlap would hide — there is no free compute window to hide
+them under, because the prefetch and the demand copy **share the same PCIe link**. The
+overlap mechanism (G2.1) is real, but it hides *demand* copy under compute only if the
+prefetch didn't have to put *extra* bytes on the wire; on a pegged link it can't. Net loss.
 
 **(b) Prediction-guided eviction (the pivot) — +1.5 pts, below gate.** The pivot's premise
 was that the 78% router prediction could drive near-Belady eviction. **It cannot, because
@@ -290,17 +299,20 @@ LRU→Belady gap is real but requires true future knowledge no available signal 
 
 **Conclusion:** the hit-rate lever is **near-exhausted at 640 slots** for this workload.
 LRU is near-optimal among implementable policies. The read-ahead idea (the user's original
-hypothesis) does not pay off on sm75 + saturated-PCIe + this model. **Phase 2 closed
-negative.** The structural win that scales is **Phase 5 (batching)**; the cheap optional
-win is **Phase 3 (static warm start)**.
+hypothesis) does not pay off on sm75 + saturated-PCIe + this model — now **measured
+directly** (G2.7 prototype: k=0 baseline beats every k>0), not just argued. **Phase 2
+closed negative.** The structural win that scales is **Phase 5 (batching)**; the cheap
+optional win is **Phase 3 (static warm start)**.
 
 <details><summary>Superseded design (prefetch) — kept for the record</summary>
 
 The YALIS/Strata `wait-and-prefetch` read-ahead: move the expert copy onto a dedicated copy
 stream, double-buffer GPU slots, run layer *l+1*'s router during layer *l*'s GEMV to prefetch
 *l+1*'s predicted experts. Ceiling 1.545× assumed a non-saturated link. G2.1 (overlap
-mechanism, 92–95%) and G2.2 (recall@8 78.1%) both PASSED, but the copy-dominated-link
-analysis shows prefetch *adds* bytes to a pegged wire → net loss. Superseded.
+mechanism, 92–95%) and G2.2 (recall@8 78.1%) both PASSED, but the **real 3-layer prototype
+(G2.7) measured the net effect and it is a loss at every k** (0.96×→0.84×): the prefetch
+adds spurious bytes to a PCIe link already pegged by the demand copy, so there is no free
+compute window to hide them under. Superseded.
 </details>
 
 ### Phase 3 — Static expert-profile warm start (Strata-style). OPTIONAL, cheap
@@ -372,6 +384,28 @@ as S6. Not part of this plan.
   **next-token** signal that does not exist. LRU is near-optimal among implementable
   policies at 640 slots. *(Note: an earlier draft of the sim used E=128; the model has
   256 experts — the corrected numbers above are from E=256.)*
+- **G2.7 real 3-layer prefetch prototype — CLOSED NEGATIVE (the arbiter).**
+  `s2_prefetch_proto.py`: real `fast_index_copy_multi` kernel (SM-driven, PCIe), real
+  routing + prediction from the capture, 16 LRU slots/layer, 256-expert host pool, 3 layers,
+  128 tokens. The prefetch for layer *l+1* (top-k of the next-layer router prediction,
+  available at the start of layer *l*'s MoE) is enqueued on a side copy stream and overlaps
+  layer *l*'s full window (faithful YALIS anchoring); the main stream waits for it, copies
+  the demand-residual, computes. Calibration: per-expert copy 0.298 ms (bpb=2, small batch)
+  vs per-layer compute 0.264 ms. Result — **k=0 (baseline, demand-only) wins at every k:**
+
+  | k | ms/layer | vs baseline |
+  |---|---|---|
+  | 0 (baseline) | 1.67 | 1.000× |
+  | 1 | 1.73 | 0.96× |
+  | 2 | 1.73 | 0.96× |
+  | 4 | 1.79 | 0.93× |
+  | 8 | 1.99 | 0.84× |
+
+  The loss grows with k because the prefetch adds **spurious** bytes (predicted but not
+  routed) to a PCIe link already pegged by the demand copy — there is no free compute
+  window to hide them under (prefetch and demand share the link). This confirms the
+  corrected byte accounting (§3 note, §4 Phase 2a) and closes the residual uncertainty
+  from G2.1. No k clears the 1.10× gate; nothing to scale to 40 layers.
 
 1. **Confirm bandwidth saturation directly** (not inferred): a microbenchmark that streams a
    known byte count CPU→GPU at cache 640 and reports effective GB/s. Expect ~13–16 GB/s
@@ -384,8 +418,8 @@ as S6. Not part of this plan.
 3. **Prototype the overlap on 2–4 layers first** (not all 40) to measure the per-layer
    copy/compute overlap fraction and the stream-sync overhead on sm75 before committing to the
    full rework. If 2–4 layers show ≥ 1.1× on their share, scale to 40.
-   *(NOT DONE — superseded: the eviction-sim result (G2.6) closed Phase 2 negative before
-   the prototype; see §4 Phase 2 and §8.)*
+   *(DONE — G2.7, see gate results below: the real 3-layer prototype shows k=0 baseline beats
+   every k>0, so there is nothing to scale.)*
 
 ---
 
@@ -413,8 +447,10 @@ as S6. Not part of this plan.
   eviction (which needs a next-token signal that doesn't exist). Best honest eviction
   policy = LRU + 1.5 pts (~1.03×, below gate).
 - **The read-ahead idea (YALIS/Strata, the user's original hypothesis) is CLOSED NEGATIVE
-  on this hardware.** Prefetch adds bytes to a copy-dominated link (net loss);
-  prediction-eviction can't get the signal it needs. Both measured, not deferred.
+  on this hardware — measured, not argued.** The real 3-layer prototype (G2.7) shows
+  prefetch loses at every k (0.96×→0.84×): it adds spurious bytes to a PCIe link already
+  pegged by the demand copy, so there is no free compute window to hide them under.
+  Prediction-eviction can't get the signal it needs (intra-token, not next-token).
 - **Strata's 60–70% is mostly bigger-cache + warm-profile + CPU co-compute** — none of
   which fit here (no VRAM headroom for a bigger cache; CPU co-compute is out of scope).
   The transferable prefetch does not help on a copy-dominated link.
