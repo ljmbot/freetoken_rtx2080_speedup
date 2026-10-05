@@ -327,15 +327,35 @@ as S6. Not part of this plan.
 
 ## 6. Open questions / next experiments (short probes, per preference)
 
+**Gate results (2026-10-05, measured):**
+
+- **G2.2 router-prediction recall — PASS.** `s2_recall_record.py` on Qwen3.6-35B-A3B-NVFP4,
+  300 decode tokens × 39 layer pairs: **recall@8 = 78.1%**, weight-covered = 85.0% at top-8;
+  recall@12 = 89.1% (92.3% weight) at top-12; recall@16 = 93.2% (95.1% weight). Per-layer
+  recall@8 spans 52% (L0) → 87% (L24), mean 78.1%. The next-layer router prediction from
+  layer *l*'s MoE-input hidden is strong on our model — matches YALIS's Qwen3-30B-A3B
+  expectation. Wasted prefetch at top-8 = 21.9% (prefetching 16 to cover 8 costs 53% waste;
+  top-8 is the sweet spot).
+- **G2.1 overlap mechanism — PASS (microbenchmark).** `s2_g21_overlap.py`: the SM-driven
+  `fast_index_copy_multi` copy on a side stream overlaps the 24 decode GEMVs on the main
+  stream at **92–95%** on sm75 (copy 1.6 ms/layer at ~12 GB/s PCIe-saturated vs compute
+  0.26 ms/layer; concurrent = max(copy, compute), compute fully hidden). `blocks_per_bank`
+  1→8 barely changes overlap (95% at bpb=8) — the copy is PCIe-bound, so it steals few SMs.
+  End-to-end ms/tok gate (≥1.10×) needs the 2–4 layer prototype below.
+
 1. **Confirm bandwidth saturation directly** (not inferred): a microbenchmark that streams a
    known byte count CPU→GPU at cache 640 and reports effective GB/s. Expect ~13–16 GB/s
    (PCIe 3.0 x16 pegged). Confirms Lever B (overlap) is the right call over Lever A (hit rate).
+   *(DONE: G2.1 microbenchmark copy = 18.9 MB/layer in 1.6 ms = ~11.8 GB/s, PCIe-saturated.)*
 2. **Measure next-layer router-prediction recall@8** on the recorded stream (`s2_route_record.py`
    output). This is G2.2 and the single number that tells us how much of the 1.545× ceiling is
    actually reachable on *our* model (vs YALIS's Qwen3-30B-A3B).
+   *(DONE: 78.1% recall@8, 85% weight-covered — see gate results above.)*
 3. **Prototype the overlap on 2–4 layers first** (not all 40) to measure the per-layer
    copy/compute overlap fraction and the stream-sync overhead on sm75 before committing to the
    full rework. If 2–4 layers show ≥ 1.1× on their share, scale to 40.
+   *(NEXT: the G2.1 microbenchmark says the mechanism holds; this prototype measures it
+   end-to-end in the real decode loop.)*
 
 ---
 
