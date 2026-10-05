@@ -1,0 +1,362 @@
+# cache_improvement_plan.md — Expert cache & PCIe expert-streaming (Qwen3.6-35B-A3B-NVFP4, RTX 2080 sm75 8 GB)
+
+**Goal.** Cut decode time by attacking the measured bottleneck — **PCIe expert streaming,
+25.7 ms/tok = 65% of decode** — and close the gap to the 60–70% expert-cache hit rates
+the Strata engine reports. Target: **~1.3–1.5× decode (25 → ~33–39 tok/s)**, measured by
+the production A/B harness, without touching the 64K-context / 640-cache / prefill invariants.
+
+**One-sentence diagnosis.** Decode is PCIe-bandwidth-bound on streaming expert weights
+CPU→GPU (one CUDA C++ kernel, `fast_index_copy_multi`). The LRU expert cache *already*
+implements read-ahead (45.7% hit at 640 slots). The remaining win is **overlapping the
+PCIe copy with compute** (next-layer routing prefetch, the YALIS/Strata technique), whose
+measured ceiling is **1.545×** and which is independent of hit rate.
+
+---
+
+## 0. The evidence (what we actually measured, 2026-10-05)
+
+All numbers from the graphed production decode path, cache 640, Q8-KV, chunked 4096 prefill.
+
+### 0.1 The bottleneck is ONE kernel (not a "herd")
+
+Full kernel dump (`s2_full_dump.py`, `/tmp/s2fd.log`), 39.3 ms/iter:
+
+| kernel | ms/iter | % of 39.3 ms |
+|---|---|---|
+| **`fast_index_copy_multi`** (CUDA C++, CPU→GPU expert copy) | **25.7** | **65%** |
+| `_gemv_splitk` (MoE GEMV) | 4.1 | 10% |
+| `_decode_nvfp4_marlin` | 3.8 | 10% |
+| GDN decode (fused_sigmoid_gating_delta_rule_update + causal_conv1d + layer_norm) | ~0.6 | 1.5% |
+| router (gatherTopK + bitonicSort + softmax_warp) | ~0.6 | 1.4% |
+| all elementwise/norm/copy combined | ~2 | ~5% |
+
+**The "thundering herd" is a single fused multi-bank copy kernel** that streams on-demand
+expert weights CPU→GPU over PCIe. It is already hand-written CUDA C++
+(`kernel/csrc/jit/fast_index_copy.cuh`, JIT-compiled) — *not* a Python problem.
+
+### 0.2 PCIe ablation — the copy is the whole story
+
+`s2_pc_test.py`, `FREETOKEN_SKIP_FAST_INDEX_COPY=1` = "experts resident" upper bound:
+
+| config | ms/tok | tok/s |
+|---|---|---|
+| normal (copy on critical path) | **39.7** | 25.2 |
+| copy free (experts resident) | **14.0** | 71.3 |
+| **Δ = PCIe expert streaming** | **25.7** | — |
+
+So the copy is 65% of decode and the compute (attention + GEMV + router + norms) is 14.0 ms.
+
+### 0.3 We are bandwidth-saturated on the copy
+
+At the measured 46.7% hit rate, ~53% of the ~0.8 GB/token of expert weights still cross
+PCIe ≈ 0.43 GB. 0.43 GB / 25.7 ms ≈ **16.7 GB/s**, at/above the effective PCIe 3.0 x16
+limit (~13–16 GB/s). **The copy engine is pegged.** This decides the lever (below): a
+*hit-rate* improvement removes bytes, but a *prefetch* (overlap) hides bytes behind compute —
+and the latter works even when bandwidth-saturated, because copy (DMA) and compute (SMs)
+are independent hardware that can run concurrently.
+
+### 0.4 The LRU cache already IS the read-ahead
+
+`offload_cache.py` keeps a shared 640-slot pool; a fetched expert stays resident and a
+next-token reuse is a free hit. That *is* "guess the next expert, keep it, throw it away if
+wrong." The measured success rate of that guess:
+
+- **Live hit rate (cache 640): 45.7%** (`--moe-collect-stats` → `decode_miss_stats()`)
+- **Working set: 7,054 distinct (layer,expert) pairs** vs 640 slots → **11× mismatch**
+- Each layer touches **~176 of its 256 experts** over 300 tokens → the router picks are too
+  diverse for a small cache to nail.
+
+### 0.5 Hit-rate ceiling (offline sim over the real recorded routing, `s2_cache_sim.py`)
+
+Recorded the actual per-token, per-layer routing (40 layers × 8 experts, 300 tokens,
+`s2_route_record.py`, graphs off / deterministic-greedy so locality matches the graphed
+path), then simulated caches offline (capacity = moe-cache-size):
+
+| cache size | LRU hit% (what we run) | Belady-OPT hit% (perfect prediction = ceiling) | gap |
+|---|---|---|---|
+| 512 | 40.3% | 64.3% | 24.0 |
+| **640** | **46.7%** (≈ live 45.7%, sim validated) | **68.2%** | **21.5** |
+| 992 | 56.6% | 75.7% | 19.1 |
+| 2048 | 74.6% | 87.0% | 12.4 |
+| 8192 | 92.7% | 92.7% | 0 |
+
+The LRU column reproduces the live 45.7%, so the sim is trustworthy. The ceiling at 640 is
+68.2% — but see §1: a *practical* predictor can't get there.
+
+### 0.6 Practical predictors can't beat LRU at 640 (`s2_cache_sim2.py`)
+
+| policy @ 640 slots | hit% |
+|---|---|
+| **LRU (baseline)** | **46.7%** |
+| LFU (global hot set) | 43.1% |
+| per-layer hot set | 41.9% |
+| Belady-OPT (ceiling) | 68.2% |
+
+**The hit-rate lever is mostly exhausted at 640 — it's a *capacity* problem, not a
+*policy* problem.** The working set (7,054 pairs) is 11× the cache (640 slots); no cheap
+rule (recency, frequency, per-layer hot) recovers the gap. Only *perfect* prediction does,
+and that requires knowing the future.
+
+### 0.7 VRAM ceiling on cache size (`cs_probe.py`, chunked 4096 prefill)
+
+| cache_size | VRAM after build | 4096-chunk prefill peak | decode |
+|---|---|---|---|
+| 512 (was current) | 6510 MiB | 7164 MiB | 24.93 tok/s |
+| **640 (shipped, `d153424`)** | 6724 MiB | 7396–7399 MiB (fits, ~200 MiB spare) | 25.81–26.97 tok/s |
+| 992 (marlin max) | 7330 MiB | **OOM** (90 MiB free) | — |
+
+Real headroom to the 7600 MiB limit is **~436 MiB** (the build already holds the full 64K
+KV+GDN pool + CUDA graphs). **640 is the max that fits; 992 OOMs.** Bigger cache is VRAM-capped.
+
+---
+
+## 1. Two independent levers (and which one pays)
+
+The decode time is `copy + compute = 25.7 + 14.0 = 39.7 ms`. There are two ways to cut it:
+
+- **Lever A — raise the hit rate (remove bytes).** At 640 slots, LRU 46.7% → OPT 68.2% is
+  the *theoretical* max, but every *practical* predictor (LFU 43.1%, per-layer hot 41.9%) is
+  **worse than LRU**. So this lever is ~exhausted at our cache size (capacity-bound).
+  Raising it needs a bigger cache, which is VRAM-capped at 640 (§0.7).
+- **Lever B — overlap copy with compute (hide the bytes).** Prefetch the next layer's
+  experts while the current layer computes. Ceiling = `max(copy, compute) = max(25.7, 14.0)
+  = 25.7 ms` → **1.545×**. This is *independent of hit rate* (prefetch moves bytes earlier,
+  it doesn't remove them) and works even though we're bandwidth-saturated, because copy and
+  compute run on independent hardware.
+
+**Lever B is the win.** It is exactly the user's read-ahead idea, in the form that actually
+works (next-*layer*, not next-*token* — see §2 and §3). Lever A is a minor supplement
+(§4 Phase 3).
+
+**Prefetch ceiling arithmetic:**
+
+```
+copy (PCIe expert streaming) = 25.7 ms/tok
+compute (copy-free)          = 14.0 ms/tok
+current serial total         = 39.7 ms/tok  (25.2 tok/s)
+perfect-overlap total        = 25.7 ms/tok  (38.9 tok/s)   <- max(copy, compute)
+ceiling speedup              = 1.545x
+```
+
+The win = hiding up to 14.0 ms of copy behind the 14.0 ms of compute. Realistic outcome is
+between 1.0× (if overlap doesn't hold on sm75) and 1.545× (perfect overlap); YALIS reports
+5–14% TPOT reduction on a *less* copy-bound setup (PCIe 4.0, copy a smaller fraction), so
+our copy=65% case should land in the upper part of that range — but the overlap fraction is
+the key thing to measure (Phase 2 gate).
+
+---
+
+## 2. Why "next-layer" and not "next-token"
+
+The user's original read-ahead idea was *next-token*: predict token *t+1*'s experts during
+token *t*'s compute. That requires knowing token *t+1*'s hidden state, which needs a full
+forward — i.e. the **MTP head**, which we already proved is too slow (MTP accept ≈ 0.46×,
+reject ≈ 0.23× vs the graphed baseline; decisively negative, closed).
+
+The **YALIS "Speculating Experts"** paper (arXiv 2603.19289) and the **Strata engine** both
+use the cheaper **next-layer** variant: predict layer *l+1*'s experts from layer *l*'s
+hidden state, *during* layer *l*'s compute. The prediction needs only the router (~0.6 ms),
+not a full transformer layer. It's a different, cheaper, and more accurate problem:
+
+- The hidden state entering layer *l* is a good proxy for the one entering layer *l+1*
+  (MoE+attention are smooth transforms). YALIS measures **small inter-layer drift beyond
+  the first 2 layers** for **Qwen3-30B-A3B — our exact model family** → high recall@k on the
+  top-ranked (high-weight) experts.
+- The prediction is used **only to prefetch** (move bytes earlier), **not to route**. The
+  true routing is unchanged, so **there is no accuracy impact** (the safe version — see §5).
+
+This is the version of the idea that works, and it's what Strata ships.
+
+---
+
+## 3. What Strata actually does (source + docs pulled)
+
+**Strata = `Niko1221/Strata`** (GitHub, MIT). Pulled `README.md`, `docs/HOW_IT_WORKS.md`,
+`docs/DETAILS.md`, `docs/BATCHING.md` (saved under `scratch/strata/`). The engine runs
+Qwen3.8-Flash-Next (a *different*, bigger MoE: 512 experts/layer, top-10, 24,576 total) on
+gaming PCs by tiering experts across **VRAM / RAM / SSD**.
+
+**The 60–70% hit rate is NOT primarily a predictor.** It comes from four things:
+
+1. **A much bigger cache.** The GPU expert cache fills "the rest of VRAM" (VRAM − ~5 GB;
+   "every extra GB holds ~700 more experts"). On a 12 GB card that's ~3,800+ experts — ~6×
+   our 640 slots. Bigger cache → higher hit rate, mechanically.
+2. **A static expert profile preloaded at start.** `data/expert-profile.bin` ranks all
+   24,576 (layer,expert) pairs from calibration (`tools/make_profile.py` + `--dump-routing`).
+   The cache starts *warm* with the hottest experts before the first token — so the
+   "conversation" hit rate is high from token 1.
+3. **An adaptive tier** (`--adapt-every`) that moves experts in/out of VRAM from live usage
+   counts, persisted across restarts (`expert_profile_save`).
+4. **CPU co-computation of misses.** This is the big one: "the CPU computes the experts that
+   are not on the GPU **in place**, at the same time as the GPU works on the cached ones
+   (AVX-512/AVX2, ggml kernels)." Strata only streams a *fraction* of misses over PCIe
+   (`--pcie-frac`); the rest are **computed on the CPU in parallel**. So a "miss" in Strata
+   is not a PCIe stall — it's overlapped CPU work. That's why Strata can be fast *despite* a
+   lower effective VRAM hit rate than it would otherwise need.
+
+**The actual predictor = `STRATA_LOOKAHEAD` routing prefetch** (the one piece that matches
+the user's hypothesis). From `docs/DETAILS.md`:
+
+> "while the CPU works on a layer, a thread applies the **next layer's router to this
+> layer's input** and asks the OS for the pages of the **predicted experts** that neither the
+> GPU nor the RAM budget holds (only pages — **the experts computed are the same**;
+> `STRATA_LOOKAHEAD=0` turns it off)."
+
+That is the YALIS technique: predict layer *l+1*'s experts from layer *l*'s input, warm the
+pages, and **the true routing still decides what's computed** (pure prefetch, no accuracy
+trade). Strata's `--stats` reports it separately: `"routing prefetch: how many of the file
+reads had been warmed."`
+
+**Why Strata's 60–70% ≠ our 45.7% (not directly comparable):**
+- Strata's cache is ~6× bigger (VRAM − 5 GB vs our 640-slot hard cap).
+- Strata preloads a static profile (warm start); we start cold.
+- Strata co-computes misses on the CPU; we stream all misses over PCIe, so we're more
+  sensitive to hit rate.
+- Different model (512 experts/layer top-10 vs our 256 top-8) → different working set.
+
+**Net:** the user's suspicion is *partly* right — Strata does do speculative next-layer
+fetch. But the 60–70% number is mostly bigger-cache + warm-profile + CPU-co-compute, with
+the prefetch as a *supplement* that makes misses cheap (overlapped) rather than as the main
+hit-rate driver. For us, the transferable, high-value piece is the **next-layer routing
+prefetch** (Phase 2). The CPU co-compute (Phase 4) is the "Strata way" but is a large
+architectural change (C++ CPU ggml kernels) for a PyTorch engine — noted, not recommended.
+
+---
+
+## 4. Phased plan (each phase: gated, default-off, rollback-safe, accuracy-reviewed)
+
+### Phase 1 — 640 MoE cache. ✅ SHIPPED (`d153424`)
+`qwen_q8.sh` `--moe-cache-size 512 → 640`. +1–2 tok/s (4–8%). Max that fits the 64K
+chunked-prefill peak (~200 MiB spare). No further cache-size headroom (992 OOMs). Done.
+
+### Phase 2 — Next-layer routing prefetch + double-buffered async copy streams. ⭐ TOP PRIORITY
+The YALIS/Strata technique, the real read-ahead. **Ceiling 1.545× (39.7 → 25.7 ms/tok).**
+
+**Design (YALIS Algorithm 1, `wait-and-prefetch`):**
+1. Move the expert copy **off the compute stream** onto a dedicated **copy stream**,
+   non-blocking, with **double-buffered** GPU expert slots (so the prefetch never clobbers
+   the in-use slot).
+2. For layer *l*: after the router emits `topk_ids(l)`, issue an **async** copy of layer
+   *l*'s experts on the copy stream; **don't block** the compute stream.
+3. **While layer *l*'s GEMV runs**, run **layer *l+1*'s router** on layer *l*'s hidden state
+   (~0.6 ms) to predict `topk_ids(l+1)`, and **issue the async copy** of layer *l+1*'s
+   predicted experts (in flight while *l* computes).
+4. Before layer *l*'s GEMV, `compute_stream.wait_stream(copy_stream)` for layer *l*'s copy.
+   Steady state: each layer's GEMV (0.35 ms) overlaps the next layer's copy (0.64 ms); the
+   copy is the bottleneck → total ≈ 25.7 ms.
+
+**Gates (must pass before production wiring):**
+- **G2.1 Overlap fraction:** measure achieved ms/tok with prefetch on a small harness.
+  Accept if **≥ 1.10×** (i.e. ≤ ~36 ms/tok). Reject if < 1.05× (overlap not holding on sm75).
+- **G2.2 Prediction recall:** on the recorded routing stream, measure the next-layer
+  router-prediction recall@8 (how many of layer *l+1*'s true top-8 are in the predicted
+  top-8 issued during *l*). YALIS expects high recall on Qwen3-30B-A3B; confirm on ours.
+  (Low recall still gives *some* overlap benefit but less; it also means more wasted
+  prefetch bytes — check the copy engine isn't saturated by wasted traffic.)
+- **G2.3 No accuracy change:** token-identical to the non-prefetch path (the prediction only
+  prefetches; true routing is unchanged — see §5).
+- **G2.4 VRAM:** double-buffering adds one extra expert-slot buffer. Must stay within the
+  ~436 MiB headroom (one buffer ≈ a few hundred MiB of expert weights — verify it fits; if
+  not, single-buffer with careful slot juggling, or reduce to per-layer-group double buffering).
+
+**Rollback:** behind `--moe-prefetch` (default off). Off = current synchronous
+`fast_index_copy_multi` path, byte-for-byte.
+
+**Effort:** medium-high (CUDA stream rework of the copy path + router lookahead + double
+buffering + the wait-and-prefetch context manager). This is the main project.
+
+### Phase 3 — Static expert-profile warm start (Strata-style). OPTIONAL, cheap
+Preload the 640-slot cache with the **hottest experts for the user's actual workload**
+(C/Java coding, bug hunts, docs-from-C) *before* the first token, instead of starting cold.
+- Build the profile by running the engine once over representative prompts with
+  `--dump-routing`-style capture (we already have the routing recorder, `s2_route_record.py`),
+  rank the (layer,expert) pairs by frequency, and seed the cache at startup.
+- **No accuracy impact** (static, no routing change). Raises the *early-token* hit rate
+  (cold start is the worst case for LRU). Complements Phase 2 (warm start + prefetch).
+- **Gate:** measure hit rate over the first N tokens with vs without the profile; accept if
+  it raises the first-100-token hit rate by ≥ 5 pts without hurting steady state.
+- **Rollback:** behind `--moe-profile <path>` (default off / no file = current behavior).
+
+### Phase 4 — CPU co-computation of misses (the "Strata way"). ⚠️ OUT OF SCOPE (noted)
+Strata's biggest lever — compute missed experts on the CPU (AVX-512/AVX2 ggml) in parallel
+with the GPU — is a large architectural change: it needs a C++ CPU expert-compute path that
+matches our NVFP4 marlin GEMV bit-for-bit, plus a `--pcie-frac` split of misses between
+PCIe-stream and CPU-compute. For a PyTorch engine on sm75 this is a multi-week effort with
+real correctness risk (CPU/GPU rounding divergence → output divergence, the exact class of
+bug §5 is designed to avoid). **Not recommended now.** Noted for completeness; revisit only
+if Phases 2+3 under-deliver and the copy remains the bottleneck.
+
+### Phase 5 — Batching (S6). STRUCTURAL, DEFERRED
+The only win that *scales*: amortize one expert fetch across N concurrent requests (the
+fetched expert serves all N). This is the real path past the single-request PCIe ceiling,
+but it's a separate, larger project (scheduler + KV + GDN for multi-request) already tracked
+as S6. Not part of this plan.
+
+---
+
+## 5. Accuracy & correctness review (the non-negotiable)
+
+- **Phase 2 (prefetch): no accuracy impact by construction.** The next-layer prediction is
+  used **only to issue a prefetch** (move bytes earlier). The **true** routing — computed by
+  the real layer-*l+1* router on the real layer-*l+1* input — decides which experts are
+  actually computed. A wrong prediction just places an expert in the LRU pool early; if it's
+  not reused it's evicted normally. This is Strata's safe version ("the experts computed are
+  the same"). **We explicitly do NOT adopt YALIS's paper variant**, which *uses* the
+  speculated experts and skips re-fetching the true ones (a small accuracy trade) — that is
+  out of bounds here.
+  - **Risk to watch:** the double-buffered prefetch must not evict an expert that the *true*
+    layer-*l+1* routing will need before it's computed. Mitigation: the prefetch issues
+    *before* the true *l+1* routing is known, so it can't know the true set — but the LRU
+    pool + the fact that the true routing is computed during *l*'s GEMV (after the prefetch
+    is in flight) means the true set is fetched on demand if not already present. The worst
+    case is a missed prefetch (no harm, just no overlap benefit), never a wrong compute.
+- **Phase 3 (profile): no accuracy impact.** Static seed, no routing change.
+- **G2.3 is the gate:** token-identical output to the non-prefetch path over the A/B harness
+  (greedy, temperature 0). Any divergence = stop, do not ship.
+- **Invariants preserved through all phases:** 64K context, `--moe-cache-size 640`, Q8-KV,
+  chunked 4096 prefill, prefill opts on `perf/sm75-prefill` protected.
+
+---
+
+## 6. Open questions / next experiments (short probes, per preference)
+
+1. **Confirm bandwidth saturation directly** (not inferred): a microbenchmark that streams a
+   known byte count CPU→GPU at cache 640 and reports effective GB/s. Expect ~13–16 GB/s
+   (PCIe 3.0 x16 pegged). Confirms Lever B (overlap) is the right call over Lever A (hit rate).
+2. **Measure next-layer router-prediction recall@8** on the recorded stream (`s2_route_record.py`
+   output). This is G2.2 and the single number that tells us how much of the 1.545× ceiling is
+   actually reachable on *our* model (vs YALIS's Qwen3-30B-A3B).
+3. **Prototype the overlap on 2–4 layers first** (not all 40) to measure the per-layer
+   copy/compute overlap fraction and the stream-sync overhead on sm75 before committing to the
+   full rework. If 2–4 layers show ≥ 1.1× on their share, scale to 40.
+
+---
+
+## 7. Rollback & safety
+
+- Every phase is **behind a flag, default-off, byte-for-byte no-op when off**
+  (`--moe-prefetch`, `--moe-profile`).
+- **Rollback path:** `git checkout backup/mtp-decode-pre-surgery` (to `cb1dda2`) or
+  `git checkout perf/sm75-prefill && git branch -D perf/mtp-decode`.
+- **Backup refs:** `backup/pre-open-heart-surgery` tag and `backup/mtp-decode-pre-surgery`
+  branch, both at `cb1dda2`.
+- **Production script invariants:** `qwen_q8.sh` keeps `--moe-cache-size 640`, `--kv-q8`,
+  `--max-prefill-length 4096`; MTP stays off (no runtime cost).
+- **A/B harness** is the arbiter for every "ship" decision (token-identical + tok/s).
+
+---
+
+## 8. Bottom line
+
+- **The bottleneck is PCIe expert streaming (65% of decode), one CUDA C++ kernel, already
+  C++, bandwidth-saturated.** Not a Python problem; a wire-limit problem.
+- **The LRU cache already does read-ahead (45.7% hit at 640).** The hit-rate lever is
+  ~exhausted at our cache size (capacity-bound: 7,054-pair working set vs 640 slots; practical
+  predictors ≤ LRU).
+- **The real win is Lever B — next-layer routing prefetch (YALIS/Strata), ceiling 1.545×.**
+  It's the user's read-ahead idea in the form that works (next-*layer*, cheap router, no MTP
+  head, no accuracy impact). **Phase 2 is the project.**
+- **Strata's 60–70% is mostly bigger-cache + warm-profile + CPU co-compute**, with the
+  next-layer prefetch as a supplement. The transferable piece is the prefetch (Phase 2); the
+  CPU co-compute (Phase 4) is noted but out of scope.
+- **Phased, gated, rollback-safe, accuracy-reviewed.** Phase 1 shipped; Phase 2 is next.
