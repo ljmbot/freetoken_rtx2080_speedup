@@ -360,6 +360,40 @@ Integrate the Section 3 design behind `--moe-prefetch-k <k>` (default 0 = today)
 Regardless of Step 2, batching is the structural win. Scope the scheduler + KV + GDN
 multi-request work as a separate project (S6). This does not depend on the prefetch verdict.
 
+### Step 5 — RESULTS (Phase 5 batching measured in the real engine, 2026-10-05)
+
+**The engine already has full batching** — no build needed: CUDA graphs at
+`[1,2,4,8,...]`, batched split-k decode attention, batched GDN, and a **single shared**
+MoE cache whose `lru_ensure` copies the **per-union** unique-missing experts per step.
+The production config just pins `--max-running-requests 1`. So the only open question was
+empirical: do concurrent requests route to enough of the same experts that the shared
+cache dedupes the H2D? Measured with the real engine's `--moe-collect-stats` counters at
+N ∈ {1,2,4} concurrent requests (distinct prompts, 512 tokens each).
+
+| bs | miss/step/layer | per-token copy | amort ratio | expert overlap | miss rate | agg tok/s |
+|---|---|---|---|---|---|---|
+| 1 | 4.240 | 4.240 | **1.000** | — | 53.0% | 22.2 |
+| 2 | 8.976 | 4.488 | **1.058** | 7.1% | 60.4% | 12.4 |
+| 4 | 26.715 | 6.679 | **1.575** | 16.0% | 99.4% | 13.6 |
+
+**Verdict — Phase 5 batching does NOT help; it makes things worse.** Per-token copy cost
+*increases* with N (4.24 → 4.49 → 6.68 experts/token); the amortization ratio is ≥ 1.0 at
+every N. Two compounding reasons: (1) **low expert overlap** — different prompts route to
+mostly-disjoint experts (7.1% at bs=2, 16.0% at bs=4), so the shared cache dedupes almost
+nothing; (2) **LRU thrashing** — the per-step working set (N × 8 × 40 layers) exceeds the
+640-slot cache (bs=4: ~1072 vs 640 → 99.4% miss). Per-step copy time balloons 24 ms →
+151 ms, so the pegged link is the binding constraint: aggregate throughput *drops*
+(22.2 → 12.4 → 13.6 tok/s) and per-request latency worsens 7×.
+
+**Why the "structural win" assumption was wrong:** batching amortizes the fetch only *if
+the requests share experts*. Qwen3.6's router does not (7–16% overlap on diverse prompts)
+and the cache can't hold the union working set. The verdict is **load-dependent**: it
+could flip only under high expert overlap (same-task/same-topic request mixes, or a
+skewed routing distribution) and/or a cache large enough to hold the per-step union.
+
+Full record + scripts: `~/.hermes/cache/scratch/step5/` (`STEP5_FINDINGS.md`,
+`run_serve.sh`, `workload.py`, `workload_N{1,2,4}.json`).
+
 ---
 
 ## 7. Risks / open questions
@@ -392,7 +426,10 @@ multi-request work as a separate project (S6). This does not depend on the prefe
   closed dead with real numbers**; the structural win is Phase 5 (batching).
 - **Q3:** the demand path is not doing unnecessary fetches — it copies only misses, with
   near-optimal LRU eviction. The only waste is the prefetch's 22 % wrong-prediction bytes.
-- **Next action:** Phase 2 (prefetch) is **closed** (Step 2, real-engine, 2026-10-05).
-  The per-request decode bottleneck is the pegged PCIe link with no redundant bytes to
-  eliminate — the only structural win is **Phase 5 (batching)**, which amortizes one
-  expert fetch across N concurrent requests and *does* reduce total H2D bytes per token.
+- **Next action (updated 2026-10-05):** Phase 2 (prefetch) **closed** (Step 2) and
+  Phase 5 (batching) **closed** (Step 5) — both measured dead in the real engine. All
+  three decode-side structural levers (prefetch / prefill warm start / batching) are now
+  closed with real numbers. Remaining: **Phase 4 (CPU co-compute)** — the multi-week C++
+  path that removes bytes from the link entirely — and a quick check of whether the
+  640-slot cache cap is VRAM-bound or a config choice (a larger cache directly cuts the
+  bs=1 copy floor: 53% miss at 640 slots).
