@@ -343,6 +343,59 @@ even with no rollback involved. Therefore:
 confirmed and documented. Do NOT proceed to S3 (production wiring) on this model —
 MTP at k=1 cannot beat 1.0× here (structural, not a bug).**
 
+### S2 deep-dive (2026-10-05) — kernel-level root cause: eager CPU/latency overhead, NOT MoE fetching
+
+Kernel-level profiler (`s2_profiler.py`, torch.profiler, warm) corrected the earlier
+"verify doesn't amortize because of expert fetching" framing. That was WRONG.
+
+**Warm 1-token decode (the 93 ms baseline):**
+- GPU kernel time: **26.9 ms** (only ~29% of the step!)
+- CPU/launch/Python: ~50 ms
+- Top GPU kernels: attention GEMV 4.0ms, **MoE Marlin decode 3.7ms**, GDN decode, norms.
+
+**Warm 2-token verify (`moe_decode=True`):**
+- GPU kernel time: **135 ms**
+- Top GPU kernels: `direct_copy` 22.9ms + `elementwise` 17.8ms (prefill-extend
+  materializing intermediates), CUTLASS f16 GEMM 7.5ms, **MoE Marlin decode 6.95ms**,
+  GDN chunk (prefill) kernels ~10ms.
+
+**Three corrected findings:**
+1. **The MoE "fetch" is NOT the bottleneck.** Marlin decode: 3.7ms (1 tok) → 6.95ms
+   (2 tok) = a clean 1.9×, and it's *small* (3ms of 153). The two-decode variant avoids
+   the 2-token prefill-extend path entirely, so it's the right choice.
+2. **The 2-token single-extend verify (135ms GPU) is slow because of the *prefill*
+   attention/GDN kernels, not the MoE.** `moe_decode=True` only switches the MoE branch;
+   GDN/attention stay on the prefill (extend) kernels (CUTLASS GEMM + chunk-GDN + ~40ms
+   of elementwise/copy), which are built for long sequences and are terrible for 2 tokens.
+   Two 1-token decodes (2×26.9=54ms GPU) beat one 2-token extend (135ms GPU). Confirms
+   the two-decode variant in the tree is correct.
+3. **The real bottleneck: the 1-token decode is CPU/latency-bound, not GPU-bound.**
+   26.9ms GPU work in a 93ms step → the GPU is idle ~70% of the time. The ~66ms of
+   non-GPU time is spread across all 40 layers: Python batch/metadata building, per-layer
+   MoE on-demand bookkeeping, ~560 tiny kernel launches, and a pure-torch router fallback.
+
+**Router cost (measured, `router_probe.py`):** pure-torch `_torch_fused_topk` = ~102
+µs/call × 40 layers = **~4 ms/decode-step**, ~13 CUDA + 20 CPU ops per call (launch
+overhead, not compute). `triton_kernels` (the fused router) is gated on sm80+
+(`backend.py:57`) → unusable on the 2080 (sm75). A fused Triton topk is feasible
+(triton 3.6.0 present) and would save ~3–4 ms/step (~4%), but it is a *secondary*
+baseline optimization, not the crux.
+
+**Precise reason MTP at k=1 can't win here:** the MTP path is **eager (bypasses the
+CUDA graph by design)**, and each of its two decodes (d1 + d2) pays the full ~93 ms
+CPU/latency-bound eager step. Two steps ≈ 2× the overhead → ~189 ms for 1–2 tokens =
+~94.5 ms/token even at 100% acceptance, which is *slower* than greedy's 93 ms/token.
+The 2nd token's GPU work amortizes fine (near-free), but its **CPU/launch overhead does
+not** — and that's what kills the speedup. MTP *would* win where the step is GPU-bound
+(big batch, or a backend that saturates the GPU) — the vendor's target regime.
+
+**Actionable (separate from MTP):**
+- (minor) fused Triton router: ~4% baseline win, sm75-safe. Optional.
+- (major, if a decode speedup is ever wanted) reduce the per-layer eager overhead the MTP
+  path pays — e.g. a graph-capturable MTP step, or batching. The router alone won't do it.
+- The MTP conclusion stands: does not win on this single-request 2080, but for a
+  precise, documented reason (eager CPU overhead), not "MoE fetching".
+
 ### S3 — Scheduler wiring (size-1 decode batches, `--mtp` gated)
 - **Do:** in the scheduler decode path, when `--mtp` and the batch is a single decode
   request, call `engine.mtp_decode_step` instead of `forward_batch`; extend the commit
