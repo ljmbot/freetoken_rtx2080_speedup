@@ -381,20 +381,35 @@ overhead, not compute). `triton_kernels` (the fused router) is gated on sm80+
 (triton 3.6.0 present) and would save ~3–4 ms/step (~4%), but it is a *secondary*
 baseline optimization, not the crux.
 
-**Precise reason MTP at k=1 can't win here:** the MTP path is **eager (bypasses the
-CUDA graph by design)**, and each of its two decodes (d1 + d2) pays the full ~93 ms
-CPU/latency-bound eager step. Two steps ≈ 2× the overhead → ~189 ms for 1–2 tokens =
-~94.5 ms/token even at 100% acceptance, which is *slower* than greedy's 93 ms/token.
-The 2nd token's GPU work amortizes fine (near-free), but its **CPU/launch overhead does
-not** — and that's what kills the speedup. MTP *would* win where the step is GPU-bound
-(big batch, or a backend that saturates the GPU) — the vendor's target regime.
+**Precise reason MTP at k=1 can't win here (CORRECTED 2026-10-05, decisive):**
+The production (non-MTP) decode is **CUDA-graphed** (`graph_runner.replay`), which
+eliminates the per-step CPU/launch/Python overhead. Measured on the same engine/slot
+(`s2_graphed_vs_eager.py`):
+  - **graphed decode (production): 43.8 ms/tok** (22.83 tok/s — matches S0 baseline)
+  - **eager decode (the path MTP is forced onto): 95.5 ms/tok** (10.48 tok/s)
+  - **eager/graphed = 2.18×**
+The ~52 ms CPU/launch overhead is *specific to the eager path*. MTP cannot use the
+graph: d2's input depends on d1's output, requiring a CPU sync mid-step that a CUDA
+graph can't express. So MTP pays the full eager cost for EACH of its two decodes.
+
+**This corrects the S2 "0.93–0.99×" figure**, which compared MTP against an *eager*
+reference (93 ms), not the *graphed* production baseline (43.8 ms). Against the real
+production path, MTP k=1 is **~2.2–4.4× SLOWER**, not "roughly equal":
+  - accept (2 tok): 2×95.5 ms / 2 tok = 95.5 ms/tok  → 43.8/95.5 ≈ **0.46×**
+  - reject (1 tok): 2×95.5 ms / 1 tok = 191 ms/tok   → 43.8/191  ≈ **0.23×**
+Even if each MTP decode were graphed individually (best case, 43.8 ms each), two
+decodes for 2 tokens = 1 decode/token = only *ties* the graphed baseline at 100%
+acceptance, and is 2× slower on every reject. **MTP k=1 is structurally capped at
+"ties at best, slower in practice" against a graphed 1-token decode.** The 2nd token's
+GPU work amortizes (near-free), but it still costs a full extra decode step (CPU +
+GPU), and against a graphed baseline that step is 2.18× the baseline token cost.
 
 **Actionable (separate from MTP):**
 - (minor) fused Triton router: ~4% baseline win, sm75-safe. Optional.
-- (major, if a decode speedup is ever wanted) reduce the per-layer eager overhead the MTP
-  path pays — e.g. a graph-capturable MTP step, or batching. The router alone won't do it.
-- The MTP conclusion stands: does not win on this single-request 2080, but for a
-  precise, documented reason (eager CPU overhead), not "MoE fetching".
+- The MTP conclusion is now DECISIVE and precise: MTP k=1 is ~2.2–4.4× SLOWER than the
+  graphed production baseline on this single-request 2080, because it is forced onto the
+  eager path. Do NOT wire it into production (S3). It would only win in a regime where
+  the baseline is ALSO eager and GPU-bound (big batch / no graph) — not this deployment.
 
 ### S3 — Scheduler wiring (size-1 decode batches, `--mtp` gated)
 - **Do:** in the scheduler decode path, when `--mtp` and the batch is a single decode
