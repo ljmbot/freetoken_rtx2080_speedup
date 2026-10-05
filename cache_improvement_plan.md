@@ -2,14 +2,23 @@
 
 **Goal.** Cut decode time by attacking the measured bottleneck — **PCIe expert streaming,
 25.7 ms/tok = 65% of decode** — and close the gap to the 60–70% expert-cache hit rates
-the Strata engine reports. Target: **~1.3–1.5× decode (25 → ~33–39 tok/s)**, measured by
-the production A/B harness, without touching the 64K-context / 640-cache / prefill invariants.
+the Strata engine reports. Target was **~1.3–1.5× decode (25 → ~33–39 tok/s)**, measured
+by the production A/B harness, without touching the 64K-context / 640-cache / prefill
+invariants.
+
+**Status (2026-10-05): investigation complete.** Phase 1 (640-slot cache) shipped (+1–2
+tok/s). Phase 2 (the read-ahead — both the YALIS/Strata next-layer *prefetch* and the
+*prediction-guided eviction* pivot) **closed negative** with measurements: prefetch adds
+bytes to a copy-dominated link (net loss), and the router prediction is an intra-token
+signal that can't drive eviction (+1.5 pts honest, below gate). LRU is near-optimal at
+640 slots. Remaining wins: Phase 3 (static warm start, cheap/optional) and Phase 5
+(batching, the structural win that scales — separate project, S6).
 
 **One-sentence diagnosis.** Decode is PCIe-bandwidth-bound on streaming expert weights
 CPU→GPU (one CUDA C++ kernel, `fast_index_copy_multi`). The LRU expert cache *already*
-implements read-ahead (45.7% hit at 640 slots). The remaining win is **overlapping the
-PCIe copy with compute** (next-layer routing prefetch, the YALIS/Strata technique), whose
-measured ceiling is **1.545×** and which is independent of hit rate.
+implements read-ahead (45.7% hit at 640 slots) and is near-optimal among implementable
+policies. The remaining structural win is **batching** (amortize one fetch across N
+requests); the per-request read-ahead levers are exhausted on this hardware.
 
 ---
 
@@ -148,6 +157,14 @@ those regimes, so expect the **mid-range (~8–12%)**, not the top of it; 1.545�
 theoretical ceiling under *perfect* overlap only. The overlap fraction is the key thing to
 measure (Phase 2 gate).
 
+> **⚠️ Post-hoc correction (2026-10-05, §4 Phase 2 closed negative):** the arithmetic above
+> holds `copy = 25.7 ms` constant while overlapping — but the overlap *requires* the
+> prefetch, and the prefetch **adds bytes** (21.9% wasted predictions + full 8-row prefetch
+> vs ~4.3 demand misses ≈ 2.3× miss traffic). On a copy-dominated link the copy time grows
+> with the extra bytes, eating the 14.0 ms of hidden compute. The 1.545× ceiling is only
+> reachable when the link has spare bandwidth (YALIS's A6000 regime); on our
+> copy-dominated sm75 link it is not. See §4 Phase 2 for the full closure.
+
 ---
 
 ## 2. Why "next-layer" and not "next-token"
@@ -234,67 +251,56 @@ architectural change (C++ CPU ggml kernels) for a PyTorch engine — noted, not 
 `qwen_q8.sh` `--moe-cache-size 512 → 640`. +1–2 tok/s (4–8%). Max that fits the 64K
 chunked-prefill peak (~200 MiB spare). No further cache-size headroom (992 OOMs). Done.
 
-### Phase 2 — Prediction-guided cache eviction. ⭐ TOP PRIORITY (pivoted 2026-10-05)
+### Phase 2 — Read-ahead (prefetch / prediction-eviction). ❌ CLOSED NEGATIVE (2026-10-05)
 
-**The pivot (measured):** The original Phase 2 (next-layer *prefetch* + double-buffered copy
-streams) is **dead on this hardware**, and the router prediction — the same signal G2.2
-measured — is worth far more as an **eviction policy** than as a prefetch trigger.
+Both forms of the YALIS/Strata read-ahead were investigated and **closed negative on this
+hardware**. This is a measured result, not a deferral.
 
-**Why prefetch loses here.** The PCIe link is **saturated** (copy 25–34 ms/tok ≫ compute
-10 ms/tok). Overlap can only reach `max(copy, compute) = copy time` (G2.1 confirmed the
-mechanism, 92–95% overlap — but overlap hides *compute* under *copy*, and copy is the
-bottleneck). Speculative prefetch **adds bytes** to a saturated link: prefetch 8 rows/layer
-+ ~1.8 demand misses ≈ **2.3× the 4.3 demand-only misses** (21.9% of prefetch is wasted
-predictions, G2.2). More bytes on a pegged wire = slower. Prefetch only pays off on a
-*non*-saturated link (copy < compute); ours is the opposite. **Do not build it.**
+**(a) Next-layer prefetch (original design) — net loss.** The PCIe link is copy-dominated
+(copy 25–34 ms/tok ≫ compute 10 ms/tok). G2.1 confirmed the *overlap mechanism* works
+(92–95% on sm75) and G2.2 confirmed the *prediction* is strong (recall@8 78.1%), but the
+prefetch **adds bytes** to a copy-dominated link: prefetch 8 rows/layer + ~1.8 demand
+misses ≈ **2.3× the 4.3 demand-only misses** (21.9% wasted). The only overlap win (hiding
+compute under copy) *requires* the prefetch, and the prefetch adds more copy time than the
+compute it hides. Net loss. *(Residual uncertainty: G2.1 used a single 18.9 MB copy; the
+real decode does many small copies that may leave link headroom. Resolvable only by the
+real-loop prototype — not worth it given (b).)*
 
-**The lever that removes bytes is hit rate.** Sim (`s2_evict_sim.py`, 1600 tokens × 40
-layers × 16 slots/layer = the 640-slot cache):
+**(b) Prediction-guided eviction (the pivot) — +1.5 pts, below gate.** The pivot's premise
+was that the 78% router prediction could drive near-Belady eviction. **It cannot, because
+the signal is the wrong kind.** The router prediction is an **intra-token (next-layer)**
+signal: `topk(gate[l+1] @ H[t,l])` predicts layer *l+1*'s routing **at the same token t**.
+Eviction needs a **next-token** signal: layer *l*'s routing at token **t+1**, which requires
+`H[t+1, l-1]` — unavailable until token t+1. There is no honest 1-token-ahead prediction.
 
-| policy | hit rate | ~ms/tok (model) |
+Corrected sim (`s2_evict_sim.py`, 1600 tokens × 40 layers × 16 slots/layer, **256 experts**):
+
+| policy | hit rate | honest? |
 |---|---|---|
-| LRU (current) | 46.7% | 35.5 |
-| **realpred (predicted-next-use eviction)** | **58.9%** | **27.8** |
-| Belady oracle (true future) | 58.6% | 28.1 |
+| LRU (current) | 46.7% | — |
+| `pred` (1-step protect) | 48.2% (+1.5) | **yes** — ~1.03×, below 1.10× gate |
+| `predhist` | 45.3% | yes — worse than LRU |
+| `realpred_peek` / `predbelady` | 58.5–58.9% | **no** — reads predictions made at future steps |
+| Belady oracle (true future) | 58.6% | no — unobtainable |
 
-`realpred` = evict the resident expert whose **predicted** next use (from the router
-prediction stream, predictions made at steps ≤ t) is farthest; tie-break by LRU recency.
-It **matches the Belady oracle** — the 78% router prediction (G2.2) is a good-enough
-1-step-ahead signal to drive near-optimal eviction. **+12.2 hit-rate points, zero extra
-PCIe bytes, zero stream rework, zero double-buffering.** Model estimate **~1.28×** on the
-copy-bound decode (35.5 → 27.8 ms/tok); the A/B harness is the arbiter.
+The 58.9% "matches Belady" figure reported during the pivot was a **future-peeking
+artifact** (`realpred_peek` consults the prediction stream at steps > t). The honest
+1-step-ahead policy is +1.5 pts over LRU — real but below the ship gate. The 12-pt
+LRU→Belady gap is real but requires true future knowledge no available signal provides.
 
-**Design:**
-1. Per layer, per decode step, compute `topk(gate(l), hidden(l-1))` (the prediction we
-   already validated in G2.2 — a small matmul, ~0.02 ms/layer, ~0.8 ms/token, inside the
-   compute budget). Maintain a rolling window of recent predictions per layer.
-2. In the cache's eviction path, replace the LRU victim pick with `realpred`: victim =
-   resident expert with the farthest predicted next use (∞ if never predicted), tie-break
-   LRU. Keep LRU as the fallback when the prediction window is empty (prefill, first tokens).
-3. No change to which experts are *computed* — only which cached slot is *evicted*.
+**Conclusion:** the hit-rate lever is **near-exhausted at 640 slots** for this workload.
+LRU is near-optimal among implementable policies. The read-ahead idea (the user's original
+hypothesis) does not pay off on sm75 + saturated-PCIe + this model. **Phase 2 closed
+negative.** The structural win that scales is **Phase 5 (batching)**; the cheap optional
+win is **Phase 3 (static warm start)**.
 
-**Gates:**
-- **G2.3 No accuracy change (by construction):** eviction never changes the computed expert
-  set — the true router still decides what runs. Token-identical to the LRU path over the
-  A/B harness (greedy, temp 0). Any divergence = stop.
-- **G2.5 End-to-end speed:** A/B harness ms/tok ≥ **1.10×** vs LRU at cache 640. The sim
-  predicts ~1.28×; accept ≥ 1.10×, investigate < 1.05× (prediction window too short /
-  prediction cost eating the gain).
-- **G2.4 VRAM:** eviction adds only a small per-layer prediction buffer (int ids, ~KB) —
-  no expert-slot growth. No headroom risk.
-
-**Effort:** low-medium. A victim-selection change in `offload_cache.py`'s eviction path + a
-per-layer prediction buffer fed from the existing gate. No CUDA stream rework.
-
-**Rollback:** behind `--moe-evict pred|lru` (default `lru` = current behavior, byte-for-byte).
-
-<details><summary>Original Phase 2 (prefetch) — superseded, kept for the record</summary>
+<details><summary>Superseded design (prefetch) — kept for the record</summary>
 
 The YALIS/Strata `wait-and-prefetch` read-ahead: move the expert copy onto a dedicated copy
 stream, double-buffer GPU slots, run layer *l+1*'s router during layer *l*'s GEMV to prefetch
-*l+1*'s predicted experts. Ceiling 1.545× **assumed a non-saturated link**. G2.1 (overlap
-mechanism, 92–95%) and G2.2 (recall@8 78.1%) both PASSED, but the saturation analysis above
-shows prefetch *adds* bytes to a pegged wire → net loss. Superseded by the eviction policy.
+*l+1*'s predicted experts. Ceiling 1.545× assumed a non-saturated link. G2.1 (overlap
+mechanism, 92–95%) and G2.2 (recall@8 78.1%) both PASSED, but the copy-dominated-link
+analysis shows prefetch *adds* bytes to a pegged wire → net loss. Superseded.
 </details>
 
 ### Phase 3 — Static expert-profile warm start (Strata-style). OPTIONAL, cheap
@@ -328,23 +334,12 @@ as S6. Not part of this plan.
 
 ## 5. Accuracy & correctness review (the non-negotiable)
 
-- **Phase 2 (prefetch): no accuracy impact by construction.** The next-layer prediction is
-  used **only to issue a prefetch** (move bytes earlier). The **true** routing — computed by
-  the real layer-*l+1* router on the real layer-*l+1* input — decides which experts are
-  actually computed. A wrong prediction just places an expert in the LRU pool early; if it's
-  not reused it's evicted normally. This is Strata's safe version ("the experts computed are
-  the same"). **We explicitly do NOT adopt YALIS's paper variant**, which *uses* the
-  speculated experts and skips re-fetching the true ones (a small accuracy trade) — that is
-  out of bounds here.
-  - **Risk to watch:** the double-buffered prefetch must not evict an expert that the *true*
-    layer-*l+1* routing will need before it's computed. Mitigation: the prefetch issues
-    *before* the true *l+1* routing is known, so it can't know the true set — but the LRU
-    pool + the fact that the true routing is computed during *l*'s GEMV (after the prefetch
-    is in flight) means the true set is fetched on demand if not already present. The worst
-    case is a missed prefetch (no harm, just no overlap benefit), never a wrong compute.
+- **Phase 2 (read-ahead): closed negative — no accuracy review needed** (nothing shipped;
+  the prefetch variant would have had no accuracy impact by construction, the eviction
+  variant never changed the computed expert set either).
 - **Phase 3 (profile): no accuracy impact.** Static seed, no routing change.
-- **G2.3 is the gate:** token-identical output to the non-prefetch path over the A/B harness
-  (greedy, temperature 0). Any divergence = stop, do not ship.
+- **Gates are the arbiter:** any shipped lever must be token-identical to the baseline over
+  the A/B harness (greedy, temperature 0). Any divergence = stop, do not ship.
 - **Invariants preserved through all phases:** 64K context, `--moe-cache-size 640`, Q8-KV,
   chunked 4096 prefill, prefill opts on `perf/sm75-prefill` protected.
 
@@ -367,6 +362,16 @@ as S6. Not part of this plan.
   0.26 ms/layer; concurrent = max(copy, compute), compute fully hidden). `blocks_per_bank`
   1→8 barely changes overlap (95% at bpb=8) — the copy is PCIe-bound, so it steals few SMs.
   End-to-end ms/tok gate (≥1.10×) needs the 2–4 layer prototype below.
+- **G2.6 eviction sim (the pivot) — CLOSED NEGATIVE.** `s2_evict_sim.py` (1600 tokens ×
+  40 layers × 16 slots/layer, 256 experts): the honest 1-step-ahead prediction-protect
+  policy (`pred`) reaches **48.2%** vs LRU **46.7%** (+1.5 pts, ~1.03× — below the 1.10×
+  gate); `predhist` (45.3%) is worse than LRU. The 58.9% "matches Belady" figure from the
+  pivot was a **future-peeking artifact** (the policy read predictions made at future
+  steps). Root cause: the router prediction is an **intra-token (next-layer)** signal —
+  strong for prefetch (G2.2's 78.1% recall) but the wrong kind for eviction, which needs a
+  **next-token** signal that does not exist. LRU is near-optimal among implementable
+  policies at 640 slots. *(Note: an earlier draft of the sim used E=128; the model has
+  256 experts — the corrected numbers above are from E=256.)*
 
 1. **Confirm bandwidth saturation directly** (not inferred): a microbenchmark that streams a
    known byte count CPU→GPU at cache 640 and reports effective GB/s. Expect ~13–16 GB/s
@@ -379,15 +384,15 @@ as S6. Not part of this plan.
 3. **Prototype the overlap on 2–4 layers first** (not all 40) to measure the per-layer
    copy/compute overlap fraction and the stream-sync overhead on sm75 before committing to the
    full rework. If 2–4 layers show ≥ 1.1× on their share, scale to 40.
-   *(NEXT: the G2.1 microbenchmark says the mechanism holds; this prototype measures it
-   end-to-end in the real decode loop.)*
+   *(NOT DONE — superseded: the eviction-sim result (G2.6) closed Phase 2 negative before
+   the prototype; see §4 Phase 2 and §8.)*
 
 ---
 
 ## 7. Rollback & safety
 
 - Every phase is **behind a flag, default-off, byte-for-byte no-op when off**
-  (`--moe-prefetch`, `--moe-profile`).
+  (`--moe-profile`).
 - **Rollback path:** `git checkout backup/mtp-decode-pre-surgery` (to `cb1dda2`) or
   `git checkout perf/sm75-prefill && git branch -D perf/mtp-decode`.
 - **Backup refs:** `backup/pre-open-heart-surgery` tag and `backup/mtp-decode-pre-surgery`
@@ -402,13 +407,19 @@ as S6. Not part of this plan.
 
 - **The bottleneck is PCIe expert streaming (65% of decode), one CUDA C++ kernel, already
   C++, bandwidth-saturated.** Not a Python problem; a wire-limit problem.
-- **The LRU cache already does read-ahead (45.7% hit at 640).** The hit-rate lever is
-  ~exhausted at our cache size (capacity-bound: 7,054-pair working set vs 640 slots; practical
-  predictors ≤ LRU).
-- **The real win is Lever B — next-layer routing prefetch (YALIS/Strata), ceiling 1.545×.**
-  It's the user's read-ahead idea in the form that works (next-*layer*, cheap router, no MTP
-  head, no accuracy impact). **Phase 2 is the project.**
-- **Strata's 60–70% is mostly bigger-cache + warm-profile + CPU co-compute**, with the
-  next-layer prefetch as a supplement. The transferable piece is the prefetch (Phase 2); the
-  CPU co-compute (Phase 4) is noted but out of scope.
-- **Phased, gated, rollback-safe, accuracy-reviewed.** Phase 1 shipped; Phase 2 is next.
+- **The LRU cache already does read-ahead (45.7–46.7% hit at 640), and it is near-optimal
+  among implementable policies.** The hit-rate lever is ~exhausted: the router prediction
+  is an intra-token (next-layer) signal — strong for prefetch, the wrong kind for
+  eviction (which needs a next-token signal that doesn't exist). Best honest eviction
+  policy = LRU + 1.5 pts (~1.03×, below gate).
+- **The read-ahead idea (YALIS/Strata, the user's original hypothesis) is CLOSED NEGATIVE
+  on this hardware.** Prefetch adds bytes to a copy-dominated link (net loss);
+  prediction-eviction can't get the signal it needs. Both measured, not deferred.
+- **Strata's 60–70% is mostly bigger-cache + warm-profile + CPU co-compute** — none of
+  which fit here (no VRAM headroom for a bigger cache; CPU co-compute is out of scope).
+  The transferable prefetch does not help on a copy-dominated link.
+- **What's left that actually pays:** Phase 3 (static warm start — cheap, optional,
+  raises early-token hit rate) and Phase 5 (batching — the structural win that scales
+  past the single-request PCIe ceiling; separate project, tracked as S6).
+- **Phased, gated, rollback-safe, accuracy-reviewed.** Phase 1 shipped (640 cache);
+  Phase 2 closed negative; Phase 3 is the only remaining quick win.
