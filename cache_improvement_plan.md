@@ -28,11 +28,12 @@ Full kernel dump (`s2_full_dump.py`, `/tmp/s2fd.log`), 39.3 ms/iter:
 | `_decode_nvfp4_marlin` | 3.8 | 10% |
 | GDN decode (fused_sigmoid_gating_delta_rule_update + causal_conv1d + layer_norm) | ~0.6 | 1.5% |
 | router (gatherTopK + bitonicSort + softmax_warp) | ~0.6 | 1.4% |
-| all elementwise/norm/copy combined | ~2 | ~5% |
+| MoE-compute-adjacent (nvfp4_gemv*, gemvx, splitk_reduce, act_and_mul, moe_sum, grouped_stage1) | ~2.3 | ~6% |
+| all elementwise/norm/copy combined | ~3.4 | ~9% |
 
 **The "thundering herd" is a single fused multi-bank copy kernel** that streams on-demand
 expert weights CPU→GPU over PCIe. It is already hand-written CUDA C++
-(`kernel/csrc/jit/fast_index_copy.cuh`, JIT-compiled) — *not* a Python problem.
+(`python/freetoken/kernel/csrc/jit/fast_index_copy.cuh`, JIT-compiled) — *not* a Python problem.
 
 ### 0.2 PCIe ablation — the copy is the whole story
 
@@ -48,9 +49,10 @@ So the copy is 65% of decode and the compute (attention + GEMV + router + norms)
 
 ### 0.3 We are bandwidth-saturated on the copy
 
-At the measured 46.7% hit rate, ~53% of the ~0.8 GB/token of expert weights still cross
-PCIe ≈ 0.43 GB. 0.43 GB / 25.7 ms ≈ **16.7 GB/s**, at/above the effective PCIe 3.0 x16
-limit (~13–16 GB/s). **The copy engine is pegged.** This decides the lever (below): a
+At the measured 46.7% hit rate, ~53% of the ~0.57 GB/token of expert weights (NVFP4 4-bit
++ fp8 scales: 8 experts × 40 layers × ~1.77 MB/expert) still cross PCIe ≈ 0.30 GB.
+0.30 GB / 25.7 ms ≈ **11.7 GB/s**, at the effective PCIe 3.0 x16 limit (~12–13 GB/s).
+**The copy engine is pegged.** This decides the lever (below): a
 *hit-rate* improvement removes bytes, but a *prefetch* (overlap) hides bytes behind compute —
 and the latter works even when bandwidth-saturated, because copy (DMA) and compute (SMs)
 are independent hardware that can run concurrently.
@@ -139,10 +141,12 @@ ceiling speedup              = 1.545x
 ```
 
 The win = hiding up to 14.0 ms of copy behind the 14.0 ms of compute. Realistic outcome is
-between 1.0× (if overlap doesn't hold on sm75) and 1.545× (perfect overlap); YALIS reports
-5–14% TPOT reduction on a *less* copy-bound setup (PCIe 4.0, copy a smaller fraction), so
-our copy=65% case should land in the upper part of that range — but the overlap fraction is
-the key thing to measure (Phase 2 gate).
+Realistic outcome is between 1.0× (if overlap doesn't hold on sm75) and 1.545× (perfect overlap).
+YALIS's real-world numbers: **12–14% TPOT on the A6000 (copy = 84–88% of TPOT — *more*
+copy-bound than us) and 5–8% on A100/GH200 (more compute-bound)**. Our copy=65% sits between
+those regimes, so expect the **mid-range (~8–12%)**, not the top of it; 1.545× is the
+theoretical ceiling under *perfect* overlap only. The overlap fraction is the key thing to
+measure (Phase 2 gate).
 
 ---
 
@@ -173,14 +177,15 @@ This is the version of the idea that works, and it's what Strata ships.
 
 **Strata = `Niko1221/Strata`** (GitHub, MIT). Pulled `README.md`, `docs/HOW_IT_WORKS.md`,
 `docs/DETAILS.md`, `docs/BATCHING.md` (saved under `scratch/strata/`). The engine runs
-Qwen3.8-Flash-Next (a *different*, bigger MoE: 512 experts/layer, top-10, 24,576 total) on
-gaming PCs by tiering experts across **VRAM / RAM / SSD**.
+Qwen3.8-Flash-Next (a *different*, bigger MoE: 512 experts/layer, 10 active per token,
+24,576 total) on gaming PCs: **all 24,576 experts live pinned in system RAM**, the GPU cache
+keeps the hottest, and the SSD holds the 28.8 GB n-gram table (PLE), not experts.
 
 **The 60–70% hit rate is NOT primarily a predictor.** It comes from four things:
 
 1. **A much bigger cache.** The GPU expert cache fills "the rest of VRAM" (VRAM − ~5 GB;
-   "every extra GB holds ~700 more experts"). On a 12 GB card that's ~3,800+ experts — ~6×
-   our 640 slots. Bigger cache → higher hit rate, mechanically.
+   "every extra GB holds ~700 more experts"). On a 12 GB card that's ~4,900 experts
+   (7 GB × 700/GB) — ~7.7× our 640 slots. Bigger cache → higher hit rate, mechanically.
 2. **A static expert profile preloaded at start.** `data/expert-profile.bin` ranks all
    24,576 (layer,expert) pairs from calibration (`tools/make_profile.py` + `--dump-routing`).
    The cache starts *warm* with the hottest experts before the first token — so the
@@ -239,8 +244,9 @@ The YALIS/Strata technique, the real read-ahead. **Ceiling 1.545× (39.7 → 25.
 2. For layer *l*: after the router emits `topk_ids(l)`, issue an **async** copy of layer
    *l*'s experts on the copy stream; **don't block** the compute stream.
 3. **While layer *l*'s GEMV runs**, run **layer *l+1*'s router** on layer *l*'s hidden state
-   (~0.6 ms) to predict `topk_ids(l+1)`, and **issue the async copy** of layer *l+1*'s
-   predicted experts (in flight while *l* computes).
+   (~0.02 ms per layer; the full 40-layer router is 0.63 ms/iter in the kernel dump) to
+   predict `topk_ids(l+1)`, and **issue the async copy** of layer *l+1*'s predicted experts
+   (in flight while *l* computes).
 4. Before layer *l*'s GEMV, `compute_stream.wait_stream(copy_stream)` for layer *l*'s copy.
    Steady state: each layer's GEMV (0.35 ms) overlaps the next layer's copy (0.64 ms); the
    copy is the bottleneck → total ≈ 25.7 ms.
@@ -256,8 +262,9 @@ The YALIS/Strata technique, the real read-ahead. **Ceiling 1.545× (39.7 → 25.
 - **G2.3 No accuracy change:** token-identical to the non-prefetch path (the prediction only
   prefetches; true routing is unchanged — see §5).
 - **G2.4 VRAM:** double-buffering adds one extra expert-slot buffer. Must stay within the
-  ~436 MiB headroom (one buffer ≈ a few hundred MiB of expert weights — verify it fits; if
-  not, single-buffer with careful slot juggling, or reduce to per-layer-group double buffering).
+  ~436 MiB headroom (one buffer ≈ tens of MiB — 8 experts × ~1.77 MB × 2 ≈ 28 MB per layer
+  pair — verify it fits; if not, single-buffer with careful slot juggling, or reduce to
+  per-layer-group double buffering).
 
 **Rollback:** behind `--moe-prefetch` (default off). Off = current synchronous
 `fast_index_copy_multi` path, byte-for-byte.
