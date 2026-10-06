@@ -33,6 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
 
+import os
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -58,6 +59,16 @@ class CutlassAttentionBackend(TritonAttentionBackend):
     def __init__(self, config: ModelConfig):
         super().__init__(config)
         self._cutlass_enabled = True  # gated by explicit --attention-backend cutlass
+        # KV segment size for the segmented GQA extend path (working set scales
+        # with this, not with context length). 8192 -> ~134 MB expansion at
+        # hd=256; measured 1.02x the full-context path at t=4096/kv=65536.
+        self.EXTEND_SEG = int(os.environ.get("FREETOKEN_CUTLASS_EXTEND_SEG", "8192"))
+        # The segmented GQA extend path needs the aten efficient-attention op with
+        # LSE output (per-segment online-softmax combine). If a future/older torch
+        # lacks it, _cutlass_extend falls back to the full-context expansion.
+        self._has_aten_lse = hasattr(
+            torch.ops.aten, "_scaled_dot_product_efficient_attention"
+        )
 
     def _dequant_kv(
         self,
@@ -132,6 +143,124 @@ class CutlassAttentionBackend(TritonAttentionBackend):
         # [1, Hq, T, D] -> [T, Hq, D]
         return o4.permute(0, 2, 1, 3).squeeze(0)
 
+    def _cutlass_extend_seg(
+        self, q, k_cache, v_cache, indices, metadata, scale, kv_heads, head_dim,
+        k_scale_flat=None, v_scale_flat=None,
+    ):
+        """Segmented GQA extend: KV segments expanded 8x, per-segment LSE, online
+        softmax combine. Bounded working set (~0.5-0.6 GB at t=4096, SEG=8192)
+        regardless of context length, vs ~1.7 GB for the full-context expansion.
+        Same speed (measured 1.02x at t=4096/kv=65536), same fp16 relL2 (~4e-4).
+        """
+        t, num_q_heads, hd = q.shape
+        g = num_q_heads // kv_heads
+        device_len = int(metadata.indptr[1].item())  # prefix + t
+        prefix = int(metadata.prefix_lens[0].item())
+
+        # Static guard: the per-segment working set is context-independent
+        # (expansion + bias + kernel workspace), so check free VRAM once.
+        try:
+            free_bytes = torch.cuda.mem_get_info()[0]
+        except Exception:
+            free_bytes = None
+        seg_peak = (
+            2 * self.EXTEND_SEG * num_q_heads * hd * q.element_size()  # k+v expanded
+            + t * self.EXTEND_SEG * q.element_size()  # bias base (stride-0 expanded)
+            + 32 * 1024 * 1024  # out + running M/S/O buffers
+            + 256 * 1024 * 1024  # kernel workspace estimate
+        )
+        if free_bytes is not None and free_bytes < seg_peak + 150 * 1024 * 1024:
+            if os.environ.get("FREETOKEN_CUTLASS_GUARD_LOG"):
+                print(
+                    f"[CUTLASS-GUARD] BAIL-seg prefix={prefix} t={t} device_len={device_len} "
+                    f"seg_peak={seg_peak/1e9:.3f}GB free={free_bytes/1e9:.3f}GB",
+                    flush=True,
+                )
+            return None
+        if os.environ.get("FREETOKEN_CUTLASS_GUARD_LOG"):
+            free_str = f"{free_bytes/1e9:.3f}GB" if free_bytes is not None else "?"
+            print(
+                f"[CUTLASS-GUARD] OK-seg prefix={prefix} t={t} device_len={device_len} "
+                f"seg_peak={seg_peak/1e9:.3f}GB free={free_str}",
+                flush=True,
+            )
+
+        q4 = q.permute(1, 0, 2).unsqueeze(0)  # [1, Hq, t, hd]
+        rows = torch.arange(t, device=q.device)
+        bound = prefix + rows  # row i attends to kv cols 0..bound[i]
+        neg = float("-inf")
+        # Accumulate the online-softmax combine in fp32 (the aten op returns LSE in
+        # fp32; fp32 running buffers are also more stable). The final output is cast
+        # back to q.dtype so downstream fp16 layers (MoE gate) see the right dtype.
+        M = torch.full((1, num_q_heads, t), neg, device=q.device, dtype=torch.float32)
+        S = torch.zeros(1, num_q_heads, t, device=q.device, dtype=torch.float32)
+        O = torch.zeros(1, num_q_heads, t, hd, device=q.device, dtype=torch.float32)
+
+        for s in range(0, device_len, self.EXTEND_SEG):
+            e_real = min(s + self.EXTEND_SEG, device_len)
+            if s > bound[-1]:
+                break  # no row sees any col in this segment
+            seg_real = e_real - s
+            # The mem-efficient kernel requires the KV segment length to be a
+            # multiple of 8 (attn_bias strideM alignment). Pad the last partial
+            # segment up to a multiple of 8; the extra positions are >= device_len
+            # so they're masked out by the causal bound for every row.
+            seg_pad = (seg_real + 7) // 8 * 8
+            sl = slice(s, e_real)
+            if k_scale_flat is not None:
+                k_seg, v_seg = self._dequant_kv(
+                    k_cache, v_cache, k_scale_flat, v_scale_flat, indices[sl], q.dtype
+                )
+            else:
+                k_seg = k_cache[indices[sl]]
+                v_seg = v_cache[indices[sl]]
+            if seg_pad > seg_real:
+                pad = seg_pad - seg_real
+                k_seg = torch.cat(
+                    [k_seg, torch.zeros(pad, *k_seg.shape[1:], device=k_seg.device, dtype=k_seg.dtype)], dim=0)
+                v_seg = torch.cat(
+                    [v_seg, torch.zeros(pad, *v_seg.shape[1:], device=v_seg.device, dtype=v_seg.dtype)], dim=0)
+            if g != 1:
+                ke = k_seg.permute(1, 0, 2).unsqueeze(0).repeat_interleave(g, dim=1)
+                ve = v_seg.permute(1, 0, 2).unsqueeze(0).repeat_interleave(g, dim=1)
+            else:
+                ke = k_seg.permute(1, 0, 2).unsqueeze(0)
+                ve = v_seg.permute(1, 0, 2).unsqueeze(0)
+            if seg_pad == seg_real and e_real <= bound[0]:
+                # every row sees the whole (unpadded) segment -> dense
+                out, lse, _, _ = torch.ops.aten._scaled_dot_product_efficient_attention(
+                    q4, ke, ve, None, True, 0.0, False, scale=scale
+                )
+            else:
+                # rows with bound[i] > s see cols s..min(e_real, bound[i]); padded
+                # cols (>= seg_real) are masked. The bias must be full BMHK
+                # ([1, Hq, t, seg_pad]) for the aten op.
+                cols = torch.arange(seg_pad, device=q.device)
+                m = (cols[None, :] < seg_real) & (cols[None, :] <= (bound - s)[:, None])
+                bias = torch.where(m, 0.0, neg).to(q.dtype).unsqueeze(0).unsqueeze(0) \
+                    .expand(1, num_q_heads, t, seg_pad)
+                out, lse, _, _ = torch.ops.aten._scaled_dot_product_efficient_attention(
+                    q4, ke, ve, bias, True, 0.0, False, scale=scale
+                )
+            del ke, ve
+            # The mem-efficient kernel pads LSE to a multiple of 64 (e.g. t=2668 ->
+            # 2688) while out keeps the true length; slice LSE back to t so the
+            # combine (buffers sized to t) lines up.
+            if lse.shape[2] != t:
+                lse = lse[:, :, :t]
+            # Fully-masked rows give lse=-inf/NaN and out=NaN; zero their weight.
+            lse = torch.where(torch.isfinite(lse), lse, torch.full_like(lse, neg))
+            out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+            # Online softmax merge (split-KV combine): M' = max(M, lse);
+            # O' = O*exp(M-M') + out*exp(lse-M'); S' = S*exp(M-M') + exp(lse-M').
+            M_new = torch.maximum(M, lse)
+            a = torch.exp(M - M_new)
+            b = torch.exp(lse - M_new)
+            O = O * a.unsqueeze(-1) + out * b.unsqueeze(-1)
+            S = S * a + b
+            M = M_new
+        return (O / S.unsqueeze(-1)).to(q.dtype).permute(0, 2, 1, 3).squeeze(0)
+
     def _cutlass_extend(
         self, q, k_cache, v_cache, indices, metadata, scale, kv_heads, head_dim,
         k_scale_flat=None, v_scale_flat=None,
@@ -143,14 +272,15 @@ class CutlassAttentionBackend(TritonAttentionBackend):
         the slow path here (~482 ms vs ~48 ms for CUTLASS at T=4096, prefix=4096,
         measured in scripts/sm75/cutlass_prefix_bench.py, relL2 2.2e-04).
 
-        Approach: gather the request's full KV (prefix + extend) from the paged cache
-        into a dense tensor (``indices`` is the in-order slot list for all
-        ``device_len`` tokens), expand GQA->MHA, and run SDPA with an explicit
-        offset-causal mask (row i of the T new tokens attends to kv cols 0..prefix+i).
+        Default path (torch with the aten efficient-attention LSE op): segmented GQA
+        (``_cutlass_extend_seg``) — bounded ~0.5-0.6 GB working set at any context
+        length. Fallback (older torch): full-context GQA->MHA expansion with a
+        free-VRAM guard that bails to Triton when the expansion would exceed 60% of
+        the free VRAM (it scales with context length, ~1.7 GB at 64K).
 
         Returns the output in the same layout as the Triton extend kernel
         (``[num_q_tokens, num_q_heads, head_dim]``), or ``None`` to fall back to
-        Triton (not eligible, or the GQA expansion would exceed the free-memory guard).
+        Triton (not eligible, or the memory guard bailed).
         """
         # Eligibility: single-request, has a cached prefix, fp16/bf16.
         if metadata.indptr.numel() - 1 != 1:
@@ -167,6 +297,13 @@ class CutlassAttentionBackend(TritonAttentionBackend):
         g = num_q_heads // kv_heads
         device_len = int(metadata.indptr[1].item())  # prefix + t
 
+        if self._has_aten_lse:
+            return self._cutlass_extend_seg(
+                q, k_cache, v_cache, indices, metadata, scale, kv_heads, head_dim,
+                k_scale_flat, v_scale_flat,
+            )
+
+        # Legacy full-context expansion (torch without the aten LSE op).
         # Memory guard: the GQA->MHA expansion materializes k and v at full q-head
         # count for the whole device_len, plus the [t, device_len] bool mask. This
         # scales with context length (e.g. ~1.4 GB at 64K), so bail to Triton if it
@@ -181,7 +318,21 @@ class CutlassAttentionBackend(TritonAttentionBackend):
             + t * num_q_heads * hd * q.element_size()  # q4
         )
         if free_bytes is not None and peak_bytes > 0.6 * free_bytes:
+            if os.environ.get("FREETOKEN_CUTLASS_GUARD_LOG"):
+                print(
+                    f"[CUTLASS-GUARD] BAIL prefix={prefix} t={t} device_len={device_len} "
+                    f"peak={peak_bytes/1e9:.3f}GB free={free_bytes/1e9:.3f}GB "
+                    f"60%free={0.6*free_bytes/1e9:.3f}GB",
+                    flush=True,
+                )
             return None
+        if os.environ.get("FREETOKEN_CUTLASS_GUARD_LOG"):
+            print(
+                f"[CUTLASS-GUARD] OK prefix={prefix} t={t} device_len={device_len} "
+                f"peak={peak_bytes/1e9:.3f}GB free={free_bytes/1e9:.3f}GB "
+                f"60%free={0.6*free_bytes/1e9:.3f}GB",
+                flush=True,
+            )
 
         # Gather the request's full KV (prefix + extend) in token order.
         if k_scale_flat is not None:
