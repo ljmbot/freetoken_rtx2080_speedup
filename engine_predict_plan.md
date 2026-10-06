@@ -421,6 +421,33 @@ Phase 4 (CPU co-compute) remains open, but its motivation (copy floor) just drop
 Full record + scripts: `~/.hermes/cache/scratch/step5/CACHE_SIZE_FINDINGS.md`,
 `run_serve_cache.sh CACHE TOKS`.
 
+### Step 6b — RESULTS (CUTLASS extend-path VRAM guard at 1280, 2026-10-06)
+
+Question: does the bigger 1280-slot cache break the CUTLASS long-prefill path, which
+bails to Triton when the GQA expansion can't fit in 60% of *free* VRAM
+(`cutlass.py`, chunk-2+ extend path only — fresh prefill is unaffected)?
+
+Instrumented the guard (`FREETOKEN_CUTLASS_GUARD_LOG=1`, temporary, reverted) and drove
+real chunked prefills at 1280 @ 64K:
+
+- **5782-token prompt: CUTLASS OK.** Chunk 1 (fresh, 4096) + chunk 2 (extend,
+  device_len=5782): `peak=0.118GB < 60%free=0.218GB` → guard passes.
+- **60020-token prompt: CUTLASS bails to Triton from chunk 2 on.** Free VRAM during
+  prefill at 1280 is only ~0.30 GB (resting 0.91 GB − prefill activations). Peak grows
+  with device_len: 0.20 GB @ 8K → 1.21 GB @ 57K, all > 0.18 GB = 60%×0.30 GB → every
+  extend chunk bails. (60K extend then crawls at ~70–120 tok/s on Triton.)
+
+**Verdict — 1280 did not newly break anything; the guard threshold is prefill-activation
+limited, not cache limited.** The bail boundary is where `peak(device_len) ≤ 0.6 ×
+free_during_prefill`. At 1280, free during prefill ≈ 0.30 GB → CUTLASS extend is only
+viable up to device_len ≈ 6–8K (chunk 1 + maybe chunk 2); beyond that it was *always*
+Triton, at 640 or 1280 (640's extra ~1.1 GB of free VRAM only moves the boundary to
+~11K). The decode win (the whole point of the 1280 change) is unaffected: decode
+attention is a different, much smaller path. Trade-off accepted: long-context (>~8K)
+prefill stays on Triton. If long-prefill speed ever matters, the fix is cutting prefill
+activation memory (e.g. smaller `--max-prefill-length` chunks don't help — peak scales
+with device_len, not chunk size), not the MoE cache.
+
 ---
 
 ## 7. Risks / open questions
