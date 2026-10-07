@@ -29,6 +29,7 @@ exec ft serve \
  --enable-cache-report \
  --kv-q8 \
  --sampling-defaults model \
+ --temperature 0.5 \
  --reasoning-parser auto \
  --host 0.0.0.0 \
  --port 8888

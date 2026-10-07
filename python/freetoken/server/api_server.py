@@ -930,6 +930,11 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
 
     if config.sampling_defaults == "model" and not config.use_dummy_weight:
         _MODEL_SAMPLING = load_generation_sampling(config.model_path)
+    # A server-level --temperature overrides the checkpoint's recommendation for every
+    # request that omits its own temperature (explicit request values still win).
+    if config.temperature is not None:
+        _MODEL_SAMPLING = dict(_MODEL_SAMPLING)
+        _MODEL_SAMPLING["temperature"] = float(config.temperature)
     # Always surface the effective default sampling (model-recommended where available,
     # else framework defaults), since unspecified request fields resolve to these.
     logger.info(
