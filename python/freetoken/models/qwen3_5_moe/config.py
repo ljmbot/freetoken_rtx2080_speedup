@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import functools
+import glob
+import json
+import os
+import re
 from typing import Any
 
 from freetoken.models.config import (
@@ -66,6 +71,96 @@ def _expert_quant(hf_config: Any) -> str:
 # Detection now lives in models/config.py (shared with muse_glimmer); weight.py imports
 # it under this name.
 _compressed_tensors_nvfp4 = detect_compressed_tensors_nvfp4
+
+
+# Routed-expert NVFP4 tensor in a compressed-tensors checkpoint (per-expert, un-fused,
+# ``model.language_model.layers.N.mlp.experts.E.{gate,up,down}_proj.weight_packed``).
+# The ``model.language_model.`` anchor excludes the MTP head's ``mtp.layers.*`` tensors.
+_CT_EXPERT_NVFP4_RE = re.compile(
+    r"^model\.language_model\.layers\.\d+\.mlp\.experts\.\d+\.(?:gate|up|down)_proj\.weight_packed$"
+)
+
+
+def _ct_checkpoint_path(hf_config: Any) -> str | None:
+    """Local checkpoint folder for a config (``_name_or_path`` when it is an existing
+    directory), else ``None``. ``cached_load_hf_config`` rebuilds the config via
+    ``type(config)(**config.to_dict())`` which preserves ``_name_or_path`` for a local
+    directory; hub ids resolve to a cache dir and are not inspected (they carry an index)."""
+    p = getattr(hf_config, "_name_or_path", None)
+    if isinstance(p, str) and p and os.path.isdir(p):
+        return p
+    return None
+
+
+@functools.lru_cache(maxsize=8)
+def _ct_nvfp4_module_map(model_path: str) -> dict[str, bool]:
+    """Inspect the checkpoint's safetensors header: which modules are stored as NVFP4
+    (``weight_packed``) vs bf16. The ``quantization_config`` flag cannot express "only the
+    MLP is NVFP4, attention is bf16" and carries a stale ``ignore`` list, so the tensor
+    layout is the ground truth. Returns ``{"has_moe_experts_nvfp4", "self_attn_nvfp4",
+    "gdn_outproj_nvfp4", "shared_expert_nvfp4", "dense_mlp_nvfp4"}``; all False if the
+    layout can't be read.
+
+    * ``has_moe_experts_nvfp4`` -- any ``.mlp.experts.<e>.{gate,up,down}_proj.weight_packed``
+    * ``self_attn_nvfp4`` -- any full-attention ``.self_attn.{q,k,v,o}_proj.weight_packed``
+      (the full-attention projections the model runs through the W4A16 kernels when
+      ``attn_quant=="nvfp4"``)
+    * ``gdn_outproj_nvfp4`` -- any GDN ``.linear_attn.out_proj.weight_packed`` (tracked
+      separately: a CT build can quantize self_attn while leaving GDN ``out_proj`` dense bf16,
+      e.g. the plain Ornith NVFP4)
+    * ``shared_expert_nvfp4`` -- any ``.mlp.shared_expert.{gate,up,down}_proj.weight_packed``
+    * ``dense_mlp_nvfp4`` -- any bare ``.mlp.{gate,up,down}_proj.weight_packed`` (dense
+      non-MoE MLP; the MoE shared_expert/experts infixes do not end with these)
+    """
+    result = {
+        "has_moe_experts_nvfp4": False,
+        "self_attn_nvfp4": False,
+        "gdn_outproj_nvfp4": False,
+        "shared_expert_nvfp4": False,
+        "dense_mlp_nvfp4": False,
+    }
+    index = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.exists(index):
+        try:
+            with open(index, encoding="utf-8") as f:
+                names = list(json.load(f)["weight_map"].keys())
+        except (OSError, ValueError, KeyError):
+            return result
+    else:  # single-file / no-index checkpoint: scan each shard's header
+        names = []
+        for shard in sorted(glob.glob(os.path.join(model_path, "*.safetensors"))):
+            if shard.endswith("consolidated.safetensors"):
+                continue
+            try:
+                with open(shard, "rb") as fh:
+                    n = int.from_bytes(fh.read(8), "little")
+                    hdr = json.loads(fh.read(n))
+            except (OSError, ValueError):
+                continue
+            names.extend(name for name in hdr if name != "__metadata__")
+    for name in names:
+        _ct_module_signal(name, result)
+    return result
+
+
+def _ct_module_signal(name: str, result: dict[str, bool]) -> None:
+    """Update ``result`` in place from one tensor name (no-op for non-``weight_packed``)."""
+    if not name.endswith(".weight_packed"):
+        return
+    if _CT_EXPERT_NVFP4_RE.match(name):
+        result["has_moe_experts_nvfp4"] = True
+    elif ".mlp.shared_expert." in name and (
+        name.endswith((".gate_proj.weight_packed", ".up_proj.weight_packed", ".down_proj.weight_packed"))
+    ):
+        result["shared_expert_nvfp4"] = True
+    elif name.endswith((".self_attn.q_proj.weight_packed", ".self_attn.k_proj.weight_packed",
+                        ".self_attn.v_proj.weight_packed", ".self_attn.o_proj.weight_packed")):
+        result["self_attn_nvfp4"] = True
+    elif name.endswith(".linear_attn.out_proj.weight_packed"):
+        result["gdn_outproj_nvfp4"] = True
+    elif name.endswith((".mlp.gate_proj.weight_packed", ".mlp.up_proj.weight_packed",
+                        ".mlp.down_proj.weight_packed")):
+        result["dense_mlp_nvfp4"] = True
 
 
 def _lm_head_quant(hf_config: Any) -> str:
@@ -170,6 +265,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # Dense attention/GDN quant is independent of the routed experts (block-fp8 already
     # quantizes both, so only probe for per-tensor FP8 when experts aren't block-fp8).
     attn_quant = "none" if expert_quant == "fp8_block" else _attn_quant(hf_config)
+    # GDN projections mirror the full-attention quant for modelopt / block-fp8 checkpoints
+    # (both quantize self_attn and GDN together); compressed-tensors checkpoints may differ
+    # (self_attn NVFP4 but GDN out_proj dense bf16) and override this below.
+    gdn_quant = attn_quant
     # NVFP4 checkpoints store the dense MLP projections (shared_expert; dense non-MoE MLP) as
     # packed FP4 exactly like the routed experts -- independent of whether attention is FP8
     # (mixed) or bf16 (pure NVFP4). Keep them native FP4 (W4A16) whenever the experts are
@@ -179,12 +278,20 @@ def parse_config(hf_config: Any) -> ModelConfig:
     dense_quant = "nvfp4" if expert_quant == "nvfp4" else _dense_mlp_quant(hf_config)
     lm_head_quant = _lm_head_quant(hf_config)
 
-    # compressed-tensors NVFP4 (dense Qwen3.6-27B): the attention (q/k/v/o, GDN out_proj) AND
-    # the dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms stay bf16. Wire the shared
-    # W4A16 kernels (attn_quant=="nvfp4" routes the attention/GDN linears through them too).
+    # compressed-tensors NVFP4: the quantization_config flag cannot express *which* modules
+    # are NVFP4 (and carries a stale ``ignore`` list), so inspect the tensor layout. Dense
+    # Qwen3.6-27B has attention + dense MLP as W4A16 NVFP4 (GDN in_proj_*/lm_head/norms bf16);
+    # the AEON MoE Ornith build has only the MLP (routed experts + shared_expert) as NVFP4 with
+    # attention/GDN bf16; the plain MoE Ornith build quantizes self_attn too but leaves GDN
+    # out_proj dense bf16. Wire the W4A16 kernels per module accordingly (attn_quant=="nvfp4"
+    # routes the full-attention linears through them; gdn_quant=="nvfp4" routes GDN out_proj).
     if _compressed_tensors_nvfp4(hf_config):
-        attn_quant = "nvfp4"
-        dense_quant = "nvfp4"
+        m = _ct_nvfp4_module_map(_ct_checkpoint_path(hf_config) or "")
+        if m["has_moe_experts_nvfp4"]:
+            expert_quant = "nvfp4"  # MoE: routed experts are NVFP4 (offload cache)
+        attn_quant = "nvfp4" if m["self_attn_nvfp4"] else "none"
+        gdn_quant = "nvfp4" if m["gdn_outproj_nvfp4"] else "none"
+        dense_quant = "nvfp4" if (m["shared_expert_nvfp4"] or m["dense_mlp_nvfp4"]) else "none"
         lm_head_quant = "none"
 
     # Dense variants (e.g. Qwen3.6-27B) report num_experts==0: route the decoder MLP through
@@ -255,6 +362,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         expert_quant=expert_quant,
         weight_block_size=weight_block_size,
         attn_quant=attn_quant,
+        gdn_quant=gdn_quant,
         dense_quant=dense_quant,
         lm_head_quant=lm_head_quant,
     )

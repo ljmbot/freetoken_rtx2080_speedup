@@ -78,20 +78,16 @@ class Qwen3_5MoE(BaseOP):
         self.shared_expert_gate = LinearReplicated(config.hidden_size, 1, has_bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        from freetoken.profiling import nvtx_range
 
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         # Compute the router + shared expert BEFORE the routed experts: the fused MoE
         # kernel may write into ``hidden_states`` in place, which would corrupt the
         # shared expert's input (HF also evaluates the shared expert first).
-        with nvtx_range("MoE_router"):
-            router_logits = self.gate.forward(hidden_states)
-        with nvtx_range("MoE_shared_expert"):
-            shared = self.shared_expert.forward(hidden_states)
-            shared = shared * torch.sigmoid(self.shared_expert_gate.forward(hidden_states))
-        with nvtx_range("MoE_routed"):
-            routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
+        router_logits = self.gate.forward(hidden_states)
+        shared = self.shared_expert.forward(hidden_states)
+        shared = shared * torch.sigmoid(self.shared_expert_gate.forward(hidden_states))
+        routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
         return (routed + shared).view(num_tokens, hidden_dim)
 
 

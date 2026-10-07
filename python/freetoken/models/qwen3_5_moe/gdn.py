@@ -53,7 +53,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
     def __init__(
         self, hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
         conv_kernel_size, rms_norm_eps, layer_id, expert_quant: str = "none",
-        attn_quant: str = "none",
+        gdn_quant: str = "none",
     ):
         self.layer_id = layer_id
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
@@ -75,7 +75,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         # weight_scale); b|a stay bf16. Both quant modes therefore split the four-way
         # fusion into an fp8 qkvz GEMM + a bf16 ba GEMM (matches sglang/vLLM).
         self._block_fp8 = expert_quant == "fp8_block"
-        self._pertensor_fp8 = attn_quant == "fp8_pertensor"
+        self._pertensor_fp8 = gdn_quant == "fp8_pertensor"
         self._fp8 = self._block_fp8 or self._pertensor_fp8
 
         self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
@@ -100,9 +100,10 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self.norm = _GatedRMSNorm(head_v_dim, eps=rms_norm_eps)
         # out_proj follows the checkpoint quant: block-fp8 / per-tensor-fp8 / compressed-tensors
         # NVFP4 (W4A16) / bf16. in_proj_* stay bf16 in every mode (above), so a compressed-tensors
-        # NVFP4 checkpoint (attn_quant=="nvfp4") only makes out_proj native FP4.
+        # NVFP4 checkpoint only makes out_proj native FP4 when gdn_quant=="nvfp4" (the plain
+        # Ornith build leaves it dense bf16 while self_attn is NVFP4).
         self.out_proj = make_replicated_quant(
-            expert_quant, attn_quant, self.value_dim, hidden_size, has_bias=False
+            expert_quant, gdn_quant, self.value_dim, hidden_size, has_bias=False
         )
 
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):
@@ -145,7 +146,6 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        from freetoken.profiling import nvtx_range
 
         ctx = get_global_ctx()
         batch = ctx.batch
@@ -163,15 +163,14 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             fla = build_fla_metadata(batch, hidden_states.device)
             batch.fla_metadata = fla
 
-        with nvtx_range("GDN_in_proj"):
-            if self._fp8:
-                qkvz = self.in_proj_qkvz.forward(hidden_states)
-                conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
-                ba = self.in_proj_ba.forward(hidden_states)
-                b, a = torch.split(ba, [self.num_v_heads, self.num_v_heads], dim=-1)
-            else:
-                proj = self.in_proj.forward(hidden_states)
-                conv_in, z, b, a = torch.split(proj, self._in_proj_split, dim=-1)
+        if self._fp8:
+            qkvz = self.in_proj_qkvz.forward(hidden_states)
+            conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
+            ba = self.in_proj_ba.forward(hidden_states)
+            b, a = torch.split(ba, [self.num_v_heads, self.num_v_heads], dim=-1)
+        else:
+            proj = self.in_proj.forward(hidden_states)
+            conv_in, z, b, a = torch.split(proj, self._in_proj_split, dim=-1)
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
@@ -191,30 +190,27 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
             )
         else:
-            with nvtx_range("GDN_conv"):
-                mixed = self._conv_prefill(
-                    conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+            mixed = self._conv_prefill(
+                conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
             # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
             q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
             k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
             v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
-            with nvtx_range("GDN_gating"):
-                g, beta = self._gate_params(a, b)
-                g = g.reshape(1, total, self.num_v_heads)
-                beta = beta.float().reshape(1, total, self.num_v_heads)
+            g, beta = self._gate_params(a, b)
+            g = g.reshape(1, total, self.num_v_heads)
+            beta = beta.float().reshape(1, total, self.num_v_heads)
             # The chunk kernel reads + writes back initial_state[cache_indices] in place;
             # fresh sequences (cached_len==0) must start from a zeroed slot.
             if fla.fresh_state_indices is not None:
                 pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
             track = fla.track_dst is not None
-            with nvtx_range("GDN_recurrence"):
-                result = gdn_prefill_chunk_fla(
-                    q, k, v, g, beta,
-                    state_source=pool.recurrent_states[li], indices=fla.cache_indices,
-                    cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
-                    return_h=track,
-                )
+            result = gdn_prefill_chunk_fla(
+                q, k, v, g, beta,
+                state_source=pool.recurrent_states[li], indices=fla.cache_indices,
+                cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+                return_h=track,
+            )
             if track:
                 core_out, h = result
                 self._write_track_snapshot(pool, li, conv_in, h, fla)
@@ -223,10 +219,8 @@ class Qwen3_5GatedDeltaNet(BaseOP):
 
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
-        with nvtx_range("GDN_norm"):
-            out = self.norm.forward(core_out, z).reshape(total, -1)
-        with nvtx_range("GDN_out_proj"):
-            return self.out_proj.forward(out)
+        out = self.norm.forward(core_out, z).reshape(total, -1)
+        return self.out_proj.forward(out)
 
 
 __all__ = ["Qwen3_5GatedDeltaNet"]

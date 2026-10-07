@@ -43,7 +43,7 @@ class Qwen3_5DecoderLayer(BaseOP):
                 rms_norm_eps=config.rms_norm_eps,
                 layer_id=layer_id,
                 expert_quant=config.expert_quant,
-                attn_quant=config.attn_quant,
+                gdn_quant=config.gdn_quant,
             )
         else:
             self.self_attn = Qwen3_5Attention(config, layer_id)

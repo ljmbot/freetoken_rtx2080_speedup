@@ -170,20 +170,7 @@ class CutlassAttentionBackend(TritonAttentionBackend):
             + 256 * 1024 * 1024  # kernel workspace estimate
         )
         if free_bytes is not None and free_bytes < seg_peak + 150 * 1024 * 1024:
-            if os.environ.get("FREETOKEN_CUTLASS_GUARD_LOG"):
-                print(
-                    f"[CUTLASS-GUARD] BAIL-seg prefix={prefix} t={t} device_len={device_len} "
-                    f"seg_peak={seg_peak/1e9:.3f}GB free={free_bytes/1e9:.3f}GB",
-                    flush=True,
-                )
             return None
-        if os.environ.get("FREETOKEN_CUTLASS_GUARD_LOG"):
-            free_str = f"{free_bytes/1e9:.3f}GB" if free_bytes is not None else "?"
-            print(
-                f"[CUTLASS-GUARD] OK-seg prefix={prefix} t={t} device_len={device_len} "
-                f"seg_peak={seg_peak/1e9:.3f}GB free={free_str}",
-                flush=True,
-            )
 
         q4 = q.permute(1, 0, 2).unsqueeze(0)  # [1, Hq, t, hd]
         rows = torch.arange(t, device=q.device)
@@ -318,21 +305,7 @@ class CutlassAttentionBackend(TritonAttentionBackend):
             + t * num_q_heads * hd * q.element_size()  # q4
         )
         if free_bytes is not None and peak_bytes > 0.6 * free_bytes:
-            if os.environ.get("FREETOKEN_CUTLASS_GUARD_LOG"):
-                print(
-                    f"[CUTLASS-GUARD] BAIL prefix={prefix} t={t} device_len={device_len} "
-                    f"peak={peak_bytes/1e9:.3f}GB free={free_bytes/1e9:.3f}GB "
-                    f"60%free={0.6*free_bytes/1e9:.3f}GB",
-                    flush=True,
-                )
             return None
-        if os.environ.get("FREETOKEN_CUTLASS_GUARD_LOG"):
-            print(
-                f"[CUTLASS-GUARD] OK prefix={prefix} t={t} device_len={device_len} "
-                f"peak={peak_bytes/1e9:.3f}GB free={free_bytes/1e9:.3f}GB "
-                f"60%free={0.6*free_bytes/1e9:.3f}GB",
-                flush=True,
-            )
 
         # Gather the request's full KV (prefix + extend) in token order.
         if k_scale_flat is not None:

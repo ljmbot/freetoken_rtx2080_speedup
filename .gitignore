@@ -240,3 +240,6 @@ artifacts/sm75-prefill/serve-profile.log
 # keep the small .table.json + backend-report.json, ignore the raw traces.
 artifacts/sm75-prefill/profile-8192/prefill-*.json
 artifacts/sm75-prefill/profile-8192-gdn/prefill-*.json
+
+# R&D / experiment material (kept on disk, NOT part of the public release)
+rnd/

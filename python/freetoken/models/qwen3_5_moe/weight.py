@@ -47,6 +47,61 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     layer_to_bank=lambda layer, config: layer,  # every layer is MoE
     desc="Qwen3.5 NVFP4 experts",
 )
+# compressed-tensors NVFP4 experts (Ornith): the same 6-bank layout, but the checkpoint
+# stores {weight_packed, weight_scale, weight_global_scale} instead of
+# {weight, weight_scale, weight_scale_2}. The CT ``weight_global_scale`` is the *quant-side*
+# scale, so the bank must store its reciprocal (the dequant-side global the W4A16 kernels
+# multiply by) -- the same convention the dense pass (nvfp4_parts_ct) already applies.
+_NVFP4_EXPERT_KEY_RE_CT = re.compile(
+    r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight_packed|weight_scale|weight_global_scale)$"
+)
+_NVFP4_SOURCE_SPEC_CT = Nvfp4ExpertSourceSpec(
+    key_pattern=_NVFP4_EXPERT_KEY_RE_CT,
+    proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+    layer_to_bank=lambda layer, config: layer,
+    desc="Qwen3.5 NVFP4 experts (compressed-tensors)",
+    kind_map={"weight_packed": "packed", "weight_scale": "scale", "weight_global_scale": "global"},
+    global_is_quant_side=True,
+)
+
+
+def _expert_source_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
+    """The NVFP4 expert-bank spec for this checkpoint: the compressed-tensors build (Ornith)
+    stores weight_packed/weight_scale/weight_global_scale; the modelopt build stores
+    weight/weight_scale/weight_scale_2. Discriminate from the checkpoint header (an index or
+    a shard header) -- the config flag can't tell the two apart. Modelopt default: a CT
+    checkpoint that somehow has no NVFP4 routed experts (none do today) keeps the modelopt
+    spec and fails loudly on the unknown tensor kind rather than silently mis-dequantizing."""
+    if not (getattr(config, "expert_quant", "") == "nvfp4"
+            and _compressed_tensors_nvfp4(cached_load_hf_config(model_path))):
+        return _NVFP4_SOURCE_SPEC
+    import glob as _glob
+
+    folder = download_hf_weight(model_path)
+    index = os.path.join(folder, "model.safetensors.index.json")
+    names = None
+    if os.path.exists(index):
+        try:
+            with open(index, encoding="utf-8") as f:
+                names = list(json.load(f)["weight_map"].keys())
+        except (OSError, ValueError, KeyError):
+            names = None
+    if names is None:  # single-file / no-index: scan shard headers (header-only, cheap)
+        names = []
+        for shard in sorted(_glob.glob(os.path.join(folder, "*.safetensors"))):
+            if shard.endswith("consolidated.safetensors"):
+                continue
+            try:
+                with open(shard, "rb") as fh:
+                    n = int.from_bytes(fh.read(8), "little")
+                    hdr = json.loads(fh.read(n))
+            except (OSError, ValueError):
+                continue
+            names.extend(nm for nm in hdr if nm != "__metadata__")
+    return _NVFP4_SOURCE_SPEC_CT if any(_NVFP4_EXPERT_KEY_RE_CT.match(nm) for nm in names) else _NVFP4_SOURCE_SPEC
+
+
 # Suffixes of the per-tensor modelopt quant scales; consumed alongside their ``.weight``,
 # never yielded on their own.
 _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
@@ -544,13 +599,32 @@ def _iter_weights_attn_fp8(
 _CT_NVFP4_FUSE: dict[str, tuple[str, ...]] = {
     ".self_attn.qkv_proj": (".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj"),
     ".mlp.gate_up_proj": (".mlp.gate_proj", ".mlp.up_proj"),
+    # MoE shared-expert MLP (Ornith): gate|up -> shared_expert.gate_up_proj, matching the
+    # model's Nvfp4DenseColMerged buffer. ``endswith(".mlp.shared_expert.gate_proj")`` does not
+    # match the bare dense ``.mlp.gate_proj`` group above (different infix).
+    ".mlp.shared_expert.gate_up_proj": (
+        ".mlp.shared_expert.gate_proj", ".mlp.shared_expert.up_proj",
+    ),
 }
 _CT_BF16_FUSE: dict[str, tuple[str, ...]] = {
     ".linear_attn.in_proj": (
         ".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z",
         ".linear_attn.in_proj_b", ".linear_attn.in_proj_a",
     ),
+    # MoE compressed-tensors checkpoints (Ornith) keep attention bf16, but the model's
+    # qkv_proj is a MERGED buffer (LinearColParallelMerged), so the bf16 path must fuse
+    # q/k/v. Only reached for bf16-attention checkpoints: a dense NVFP4-attention build
+    # (Qwen3.6-27B) takes the native NVFP4 fusion above, never the bf16 path.
+    ".self_attn.qkv_proj": (".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj"),
 }
+# GDN in_proj_* compute in bf16 (model contract) even when a dense checkpoint stores them
+# NVFP4 (e.g. sakamakismile/Qwen3.6-27B-NVFP4): the dense pass dequants them to bf16 before
+# the bf16 fusion assembles in_proj. Scoped to in_proj ONLY -- NOT the bf16 qkv_proj fusion,
+# which must stay out of the NVFP4 path so a dense NVFP4-attention build keeps q/k/v native.
+_CT_GDN_IN_PROJ_PARTS = (
+    ".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z",
+    ".linear_attn.in_proj_b", ".linear_attn.in_proj_a",
+)
 # The scale suffixes and parts/fuse machinery are shared with muse_glimmer and live
 # in models/loader.py.
 _CT_SCALE_SUFFIXES = CT_SCALE_SUFFIXES
@@ -609,6 +683,12 @@ def _iter_weights_compressed_tensors(
                     continue
                 if raw_name.endswith(_CT_SCALE_SUFFIXES):
                     continue  # consumed with weight_packed (or unused W4A4 activation scales)
+                # Routed experts go to the NVFP4 offload bank reader (setup_offload_expert_banks),
+                # not the dense pass. MoE compressed-tensors checkpoints (Ornith) store them
+                # per-expert un-fused; the dense path must skip them (cf. the modelopt path's
+                # ``_NVFP4_EXPERT_RE`` skip).
+                if _NVFP4_EXPERT_RE.search(raw_name):
+                    continue
 
                 name = _rename(raw_name)
                 if name is None:
@@ -620,8 +700,9 @@ def _iter_weights_compressed_tensors(
                     w, s, g = _nvfp4_parts_ct(reader, raw_base)
                     # GDN in_proj_* compute in bf16 (model contract) but some checkpoints
                     # (e.g. sakamakismile/Qwen3.6-27B-NVFP4) quantize them too: dequant to
-                    # bf16 here and let the bf16 fusion assemble ``in_proj`` as usual.
-                    if any(base.endswith(p) for ps in _CT_BF16_FUSE.values() for p in ps):
+                    # bf16 here and let the bf16 fusion assemble ``in_proj`` as usual. Scoped
+                    # to in_proj -- q/k/v of a dense NVFP4-attention build stay native below.
+                    if base.endswith(_CT_GDN_IN_PROJ_PARTS):
                         bf16 = _dequant_nvfp4_weight(w, s, g[:1])
                         yield from _emit_bf16_weight(base + ".weight", bf16)
                         continue
@@ -1057,11 +1138,13 @@ def load_nvfp4_expert_sources(
     model_path: str, config, *, layer_sink=None
 ) -> dict[str, torch.Tensor]:
     """Build the CPU NVFP4 expert source banks for the offload cache (gate/up fused on the
-    output-row axis, down separate; weight_scale_2 carried as the per-row global scale)."""
+    output-row axis, down separate; the per-tensor global scale carried as ``*_global``).
+    The spec is chosen per checkpoint (compressed-tensors vs modelopt) by
+    :func:`_expert_source_spec`."""
     return load_nvfp4_expert_source_banks(
         model_path,
         config,
-        _NVFP4_SOURCE_SPEC,
+        _expert_source_spec(model_path, config),
         drop_page_cache=drop_page_cache,
         primary=get_tp_info().is_primary(),
         layer_sink=layer_sink,
@@ -1077,7 +1160,7 @@ def load_nvfp4_expert_sources_parallel(
     return load_nvfp4_expert_source_banks_parallel(
         model_path,
         config,
-        _NVFP4_SOURCE_SPEC,
+        _expert_source_spec(model_path, config),
         drop_page_cache=drop_page_cache,
         primary=get_tp_info().is_primary(),
         workers=workers,

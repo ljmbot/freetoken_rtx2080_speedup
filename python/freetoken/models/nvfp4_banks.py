@@ -4,7 +4,7 @@ import collections
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 import safetensors
@@ -22,6 +22,23 @@ class Nvfp4ExpertSourceSpec:
     proj_to_role: dict[str, str]
     layer_to_bank: LayerToBank
     desc: str
+    # checkpoint tensor-kind suffix -> bank role ("packed" | "scale" | "global"). The
+    # modelopt build stores {weight, weight_scale, weight_scale_2}; the compressed-tensors
+    # build stores {weight_packed, weight_scale, weight_global_scale}. Both map onto the same
+    # 6-bank layout (packed uint8 / fp8 block scale / per-row fp16 global).
+    kind_map: dict[str, str] = field(default_factory=lambda: {
+        "weight": "packed", "weight_scale": "scale", "weight_scale_2": "global",
+    })
+    # True when the stored global is the *quant-side* scale (compressed-tensors
+    # ``weight_global_scale``) and the bank must store its reciprocal (the dequant-side
+    # global the W4A16 kernels multiply by). False for modelopt ``weight_scale_2`` (already
+    # the dequant-side global).
+    global_is_quant_side: bool = False
+
+
+def _is_global_kind(spec: Nvfp4ExpertSourceSpec, kind: str) -> bool:
+    """True when ``kind`` maps to the per-row global scale (vs packed/weight_scale)."""
+    return spec.kind_map.get(kind) == "global"
 
 
 def _num_moe_layers(config) -> int:
@@ -113,9 +130,9 @@ def load_nvfp4_expert_source_banks(
         if proj not in spec.proj_to_role:
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert projection {proj!r}")
         kind = match.group("kind")
-        if kind == "weight_scale_2":
+        if _is_global_kind(spec, kind):
             global_shards[shard].append((name, match, bank_layer))
-        elif kind in {"weight", "weight_scale"}:
+        elif spec.kind_map.get(kind) in {"packed", "scale"}:
             weight_shards[shard].append((name, match, bank_layer))
         else:
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
@@ -130,7 +147,10 @@ def load_nvfp4_expert_source_banks(
                     int(match.group("expert")),
                     match.group("proj"),
                 )
-                globals_map[key] = f.get_tensor(name).to(torch.float16)
+                g = f.get_tensor(name)
+                # CT stores the quant-side global; the bank needs the reciprocal (dequant-side).
+                g = (1.0 / g) if spec.global_is_quant_side else g
+                globals_map[key] = g.to(torch.float16)
         drop_page_cache(path)
 
     _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
@@ -156,7 +176,7 @@ def load_nvfp4_expert_source_banks(
                     role = spec.proj_to_role[proj]
                     kind = match.group("kind")
                     tensor = f.get_tensor(name)
-                    if kind == "weight":
+                    if spec.kind_map.get(kind) == "packed":
                         if role == "gate":
                             gate_up_packed[bank_layer_id][expert, :I] = tensor
                         elif role == "up":
@@ -237,9 +257,9 @@ def load_nvfp4_expert_source_banks_parallel(
         if bank_layer is None:
             continue
         kind = match.group("kind")
-        if kind == "weight_scale_2":
+        if _is_global_kind(spec, kind):
             global_names_by_shard[shard].append(name)
-        elif kind in {"weight", "weight_scale"}:
+        elif spec.kind_map.get(kind) in {"packed", "scale"}:
             weight_info[name] = (match, bank_layer)
         else:
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
@@ -252,8 +272,11 @@ def load_nvfp4_expert_source_banks_parallel(
         with safetensors.safe_open(path, framework="pt", device="cpu") as f:
             for name in global_names_by_shard[shard]:
                 m = spec.key_pattern.match(name)
+                g = f.get_tensor(name)
+                # CT stores the quant-side global; the bank needs the reciprocal (dequant-side).
+                g = (1.0 / g) if spec.global_is_quant_side else g
                 globals_map[(int(m.group("layer")), int(m.group("expert")), m.group("proj"))] = (
-                    f.get_tensor(name).to(torch.float16)
+                    g.to(torch.float16)
                 )
         drop_page_cache(path)
 
@@ -280,7 +303,7 @@ def load_nvfp4_expert_source_banks_parallel(
             proj = match.group("proj")
             role = spec.proj_to_role[proj]
             kind = match.group("kind")
-            if kind == "weight":
+            if spec.kind_map.get(kind) == "packed":
                 if role == "gate":
                     gate_up_packed[bank_layer_id][expert, :I] = tensor
                 elif role == "up":

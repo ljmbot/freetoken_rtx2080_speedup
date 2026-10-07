@@ -231,6 +231,14 @@ class ModelConfig:
     # scale and runs a W8A16 kernel (modelopt MIXED_PRECISION); "none" leaves them bf16
     # (dequant-at-load for any other dense quant, e.g. NVFP4 shared_expert/lm_head).
     attn_quant: str = "none"
+    # Weight quantization of the GatedDeltaNet (linear-attention) projections, tracked
+    # separately from ``attn_quant`` because a compressed-tensors checkpoint can quantize the
+    # full-attention (self_attn) projections and the GDN ``out_proj`` *independently* (e.g. the
+    # plain Ornith NVFP4 build stores self_attn as W4A16 NVFP4 but GDN ``out_proj`` as dense
+    # bf16). "nvfp4" keeps GDN ``out_proj`` packed (W4A16); "fp8_pertensor" keeps GDN in_proj /
+    # out_proj fp8-e4m3 (modelopt MIXED_PRECISION, where it equals ``attn_quant``); "none" leaves
+    # them bf16. For non-CT checkpoints it mirrors ``attn_quant``.
+    gdn_quant: str = "none"
     # Weight quantization of the *dense* NVFP4 MLP projections -- the shared expert, and dense
     # (non-MoE) MLP layers -- which NVFP4 checkpoints store as packed FP4 like the routed
     # experts. "nvfp4" keeps them packed and runs the W4A16 dense kernels (quartering their

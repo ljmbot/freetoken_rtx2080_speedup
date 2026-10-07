@@ -49,6 +49,33 @@ uv venv && source .venv/bin/activate
 uv pip install -e ".[accel]"
 ```
 
+## sm75 / 8 GB improvements (this fork)
+
+This fork adds verified support for running **RedHat (Neural Magic)
+[Ornith-1.0-35B-NVFP4](https://huggingface.co/RedHatAI/Ornith-1.0-35B-NVFP4)**
+(35B Qwen3.5-MoE, W4A4 NVFP4) on **8 GB Turing GPUs (RTX 2080/2080 Ti, sm75)**
+with a **64K context window** — measured on an RTX 2080: ~55 tok/s prefill,
+~55 tok/s decode, peak 7.4 GB VRAM. See **[launch_ornith.md](launch_ornith.md)**
+for the full command, every `--switch`/env var, and tuning notes.
+
+Key improvements:
+
+- **CUTLASS prefill attention** (`--attention-backend cutlass`): PyTorch CUTLASS
+  memory-efficient SDPA for prefill (~10–13x faster than the Triton extend kernel
+  at production geometry), with a built-in free-VRAM guard that bails to the Triton
+  kernel if a long-context expansion would not fit.
+- **Tensor-core prefill GEMMs on sm75** (`FREETOKEN_E1_CUBLAS=1`,
+  `FREETOKEN_E3_CUBLAS=1`, `FREETOKEN_E3_GROUP=16`): dense and NVFP4-expert
+  prefill GEMMs run on cuBLAS fp16 tensor cores, with grouped dequant bounded to
+  fit 8 GB. No-op on sm89+.
+- **sm75-tuned GDN recurrence** (`FREETOKEN_GDN_SM75_TUNE=1`): ~4.5x faster gated
+  delta net recurrence, bit-identical output.
+- **Q8 KV cache** (`--kv-q8`): int8 + per-head-scale paged KV, dequantized
+  in-kernel — halves KV VRAM to make 64K fit on 8 GB.
+- **Ornith NVFP4 (compressed-tensors) model support**: loader, weight mapping, and
+  multimodal (Qwen3.5-MoE) model files, with optional vision-tower skip
+  (`FREETOKEN_LOAD_VISION=0`) for text-only serving.
+
 For More details:
 
 - [Install FreeToken](https://github.com/FlashML-org/FreeToken/blob/main/docs/install.md)
