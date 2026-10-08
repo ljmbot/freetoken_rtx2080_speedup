@@ -154,7 +154,9 @@ class TritonAttentionBackend(BaseAttnBackend):
         kv_heads, head_dim = k_raw.shape[-2], k_raw.shape[-1]
         assert head_dim == q.shape[-1]
         k_cache = k_raw.view(-1, kv_heads, head_dim)
-        v_cache = v_raw.view(-1, kv_heads, head_dim)
+        # Packed sub-byte V slabs are narrower than head_dim (int4: D/2, int5: 5D/8);
+        # the launcher infers the V bit width from this row width.
+        v_cache = v_raw.view(-1, kv_heads, v_raw.shape[-1])
 
         # Q8_0 KV cache: the Triton kernels dequantize in-kernel via k_scale/v_scale.
         q8 = getattr(self.kvcache, "q8", False)

@@ -41,6 +41,23 @@ template <std::size_t kBytes,
           std::size_t kUnit = details::resolve_unit_size(kBytes)>
 __always_inline __device__ void copy(void *__restrict__ dst,
                                      const void *__restrict__ src) {
+  if constexpr (kUnit == 0) {
+    // Row size not a multiple of 4 warp packages (e.g. a 160-byte packed
+    // int5 V row): per-lane byte loop at stride kWarpThreads. Coalescing is
+    // byte-granular; correctness over bandwidth for these small rows.
+    constexpr std::size_t kPerLane =
+        (kBytes + kWarpThreads - 1) / kWarpThreads;
+    const auto dst_b = static_cast<char *>(dst);
+    const auto src_b = static_cast<const char *>(src);
+    const auto lane_id = threadIdx.x % kWarpThreads;
+#pragma unroll
+    for (std::size_t i = 0; i < kPerLane; ++i) {
+      const std::size_t j = i * kWarpThreads + lane_id;
+      if (j < kBytes) {
+        dst_b[j] = src_b[j];
+      }
+    }
+  } else {
   using Package = details::mem_package_t<kBytes, kUnit>;
   constexpr auto kBytesPerLoop = sizeof(Package) * kWarpThreads;
   constexpr auto kLoopCount = kBytes / kBytesPerLoop;
@@ -55,6 +72,7 @@ __always_inline __device__ void copy(void *__restrict__ dst,
   for (std::size_t i = 0; i < kLoopCount; ++i) {
     const auto j = i * kWarpThreads + lane_id;
     dst_packed[j] = src_packed[j];
+  }
   }
 }
 

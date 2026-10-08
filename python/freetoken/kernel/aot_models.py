@@ -356,8 +356,18 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
 )
 
 
-def store_element_sizes(model: AotModel) -> set[int]:
-    return {kv * hd * KV_CACHE_DTYPE_BYTES for kv, hd in model.kv_groups}
+def store_element_sizes(model: AotModel) -> set[tuple[int, int]]:
+    # Per (kv_heads, head_dim) group: (K row bytes, V row bytes) for the
+    # plain bf16 cache and the quantized caches the MHA pool can allocate:
+    # q8 int8 (1 B/elem), q8+int4 V (packed), q8+int5 V (packed). K is
+    # always 1 B/elem under q8; V packs to head_dim*v_bits/8 bytes.
+    sizes: set[tuple[int, int]] = set()
+    for _kv, hd in model.kv_groups:
+        sizes.add((hd * KV_CACHE_DTYPE_BYTES, hd * KV_CACHE_DTYPE_BYTES))
+        sizes.add((hd, hd))  # q8: int8 K + int8 V
+        sizes.add((hd, hd * 4 // 8))  # q8 + int4 V
+        sizes.add((hd, hd * 5 // 8))  # q8 + int5 V
+    return sizes
 
 
 def index_variants(model: AotModel) -> set[tuple[int, int]]:
@@ -378,8 +388,8 @@ def fast_index_copy_feature_sizes(model: AotModel) -> set[int]:
 
 
 
-def aggregate_store_element_sizes() -> tuple[int, ...]:
-    sizes: set[int] = set()
+def aggregate_store_element_sizes() -> tuple[tuple[int, int], ...]:
+    sizes: set[tuple[int, int]] = set()
     for model in SUPPORTED_MODELS:
         sizes.update(store_element_sizes(model))
     return tuple(sorted(sizes))

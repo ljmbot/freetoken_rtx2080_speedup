@@ -533,6 +533,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-v-bits",
+        type=int,
+        choices=(4, 5, 8),
+        default=ServerArgs.kv_v_bits,
+        help=(
+            "Pack the paged V cache sub-byte: 4 = signed int4 nibbles, 5 = int5 "
+            "5-bit fields (8 = plain int8, the default, a byte-for-byte no-op). "
+            "Halves (4) or saves ~37% (5) of the V slab on top of --kv-q8. "
+            "Requires --kv-q8 for the per-(token,head) fp32 scales."
+        ),
+    )
+
+    parser.add_argument(
         "--mtp",
         action="store_true",
         default=ServerArgs.mtp,

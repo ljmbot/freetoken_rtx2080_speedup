@@ -11,6 +11,64 @@ _MAX_KV_SPLITS = 8
 _MIN_BLOCK_KV = 32
 
 
+@triton.jit
+def _deq_v4(vb, scale, BLOCK_V2: tl.constexpr, HAS_SCALE: tl.constexpr):
+    """Dequantize a packed int4 V tile ``[BLOCK_N, BLOCK_V2//2]`` uint8 -> ``[BLOCK_N, BLOCK_V2]`` fp32.
+
+    Two's-complement nibbles packed low-nibble-first (byte i = lo | (hi << 4),
+    field 2i = lo, 2i+1 = hi); sign-extend branch-free with ``(nib ^ 8) - 8``.
+    ``HAS_SCALE`` folds the per-(token, head) fp32 scale row into the result
+    (kernel 2 folds it into P instead, so it passes HAS_SCALE=False).
+    """
+    b = vb.to(tl.int32)
+    lo = (b & 0xF) ^ 8
+    hi = (b >> 4) ^ 8
+    v = tl.interleave(lo, hi) - 8  # field j lands in column j
+    v = v.to(tl.float32)
+    if HAS_SCALE:
+        v = v * scale[:, None].to(tl.float32)
+    return v
+
+
+@triton.jit
+def _deq_v5(vb, scale, BLOCK_N: tl.constexpr, BLOCK_VB: tl.constexpr, BLOCK_DV: tl.constexpr, HAS_SCALE: tl.constexpr):
+    """Dequantize a packed int5 V tile ``[BLOCK_N, BLOCK_VB]`` uint8 -> ``[BLOCK_N, BLOCK_DV]`` fp32.
+
+    8 fields per 5-byte group: field j lives at bit ``5j % 8`` of byte ``5j // 8``
+    (40-bit group emitted little-endian, field 0 in the low bits). A field
+    straddles the byte boundary when ``r > 3``, so read the pair (b0, b0+1) and
+    stitch ``((b0 >> r) | (b1 << (8 - r))) & 0x1F``; the b1 term is zeroed when
+    the field fits in b0 (and b0+1 is clamped for the tail field). Sign-extend
+    with ``(f ^ 16) - 16``. Requires BLOCK_VB >= 5*BLOCK_DV//8.
+    """
+    b = vb.to(tl.int32)
+    j = tl.arange(0, BLOCK_DV)
+    b0 = (5 * j) >> 3
+    r = (5 * j) & 7
+    idx0 = tl.broadcast_to(b0[None, :], (BLOCK_N, BLOCK_DV))
+    idx1 = tl.minimum(idx0 + 1, BLOCK_VB - 1)
+    lo = tl.gather(b, idx0, 1) >> r[None, :]
+    hi = tl.where(r[None, :] > 3, tl.gather(b, idx1, 1) << (8 - r)[None, :], 0)
+    f = (lo | hi) & 0x1F
+    v = ((f ^ 16) - 16).to(tl.float32)
+    if HAS_SCALE:
+        v = v * scale[:, None].to(tl.float32)
+    return v
+
+
+def _v_bits_from_slab(v_cache: torch.Tensor, head_dim: int) -> int:
+    """Infer the V-slab quantization width from its row width: head_dim (int8/fp16),
+    head_dim//2 (packed int4), or 5*head_dim//8 (packed int5)."""
+    w = v_cache.shape[-1]
+    if w == head_dim:
+        return 8
+    if w * 2 == head_dim:
+        return 4
+    if w * 8 == 5 * head_dim:
+        return 5
+    raise ValueError(f"unexpected V slab width {w} for head_dim {head_dim}")
+
+
 @functools.lru_cache(maxsize=None)
 def _optin_smem_bytes(device_index: int) -> int:
     """Per-block opt-in shared-memory budget for a CUDA device (0 if unavailable)."""
@@ -79,6 +137,8 @@ def _paged_attention_kernel(
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
     Q8: tl.constexpr,
+    VBITS: tl.constexpr,
+    BLOCK_VB: tl.constexpr,
 ):
     q_tok = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -145,24 +205,45 @@ def _paged_attention_kernel(
             alpha = tl.exp(m_i - m_new)
             p = tl.exp(scores - m_new)
 
-            v = tl.load(
-                v_ptr
-                + slots[:, None] * stride_vs
-                + kv_head * stride_vh
-                + offs_d[None, :],
-                mask=(offs_n[:, None] < kv_len) & mask_d[None, :],
-                other=0.0,
-            )
-            if Q8:
-                # v is [BLOCK_N, BLOCK_D] int8; per-(token, head) scale is [BLOCK_N].
+            if Q8 and VBITS < 8:
+                # Packed V slab: [BLOCK_N, BLOCK_VB] uint8 -> [BLOCK_N, BLOCK_D] fp32.
+                offs_vb = tl.arange(0, BLOCK_VB)
+                vb = tl.load(
+                    v_ptr
+                    + slots[:, None] * stride_vs
+                    + kv_head * stride_vh
+                    + offs_vb[None, :],
+                    mask=(offs_n[:, None] < kv_len) & (offs_vb[None, :] < D * VBITS // 8),
+                    other=0.0,
+                )
                 vs = tl.load(
                     v_scale_ptr + slots * stride_vscale_s + kv_head,
                     mask=mask_n,
                     other=0.0,
                 )
-                v = v.to(tl.float32) * vs[:, None].to(tl.float32)
+                if VBITS == 4:
+                    v = _deq_v4(vb, vs, BLOCK_VB * 2, True)
+                else:
+                    v = _deq_v5(vb, vs, BLOCK_N, BLOCK_VB, BLOCK_D, True)
             else:
-                v = v.to(tl.float32)
+                v = tl.load(
+                    v_ptr
+                    + slots[:, None] * stride_vs
+                    + kv_head * stride_vh
+                    + offs_d[None, :],
+                    mask=(offs_n[:, None] < kv_len) & mask_d[None, :],
+                    other=0.0,
+                )
+                if Q8:
+                    # v is [BLOCK_N, BLOCK_D] int8; per-(token, head) scale is [BLOCK_N].
+                    vs = tl.load(
+                        v_scale_ptr + slots * stride_vscale_s + kv_head,
+                        mask=mask_n,
+                        other=0.0,
+                    )
+                    v = v.to(tl.float32) * vs[:, None].to(tl.float32)
+                else:
+                    v = v.to(tl.float32)
             acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
             l_i = l_i * alpha + tl.sum(p, axis=0)
             m_i = m_new
@@ -215,6 +296,8 @@ def _decode_grouped_stage1_kernel(
     DV: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     Q8: tl.constexpr,
+    VBITS: tl.constexpr,
+    BLOCK_VB: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
     head_block_id = tl.program_id(1)
@@ -295,12 +378,27 @@ def _decode_grouped_stage1_kernel(
                 scores = scores * ks[None, :]
             scores = tl.where(mask_h[:, None] & mask_n[None, :], scores, -float("inf"))
 
-            v = tl.load(
-                v_ptr + slots[:, None] * stride_vs + v_base_offsets,
-                mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
-            )
-            v = v.to(q_ptr.dtype.element_ty)
+            if Q8 and VBITS < 8:
+                # Packed V slab: [BLOCK_N, BLOCK_VB] uint8 -> [BLOCK_N, BLOCK_DV] fp32.
+                # The per-token scale folds into P below (same as the int8 path).
+                offs_vb = tl.arange(0, BLOCK_VB)
+                vb = tl.load(
+                    v_ptr + slots[:, None] * stride_vs + kv_head * stride_vh + offs_vb[None, :],
+                    mask=mask_n[:, None] & (offs_vb[None, :] < DV * VBITS // 8),
+                    other=0.0,
+                )
+                if VBITS == 4:
+                    v = _deq_v4(vb, v_scale_ptr, BLOCK_VB * 2, False)
+                else:
+                    v = _deq_v5(vb, v_scale_ptr, BLOCK_N, BLOCK_VB, BLOCK_DV, False)
+                v = v.to(q_ptr.dtype.element_ty)
+            else:
+                v = tl.load(
+                    v_ptr + slots[:, None] * stride_vs + v_base_offsets,
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                )
+                v = v.to(q_ptr.dtype.element_ty)
 
             m_new = tl.maximum(tl.max(scores, axis=1), m_i)
             alpha = tl.exp(m_i - m_new)
@@ -455,7 +553,8 @@ def decode_paged_attention(
         v_scale = v_scale.contiguous()
     assert batch == indptr.numel() - 1
     assert v_cache.shape[1] == num_kv_heads
-    assert k_cache.shape[-1] == head_dim and v_cache.shape[-1] == head_dim
+    assert k_cache.shape[-1] == head_dim
+    vbits = _v_bits_from_slab(v_cache, head_dim)
     assert num_q_heads % num_kv_heads == 0
     assert attn_logits.shape[0] >= batch
     assert attn_logits.shape[1] >= num_q_heads
@@ -480,6 +579,7 @@ def decode_paged_attention(
     block_h = triton.next_power_of_2(valid_block_h)
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)
+    block_vb = triton.next_power_of_2(head_dim * vbits // 8)
 
     # Q8 scale pointers/strides. The scale slab is [num_slots, num_kv_heads]; the kernel
     # indexes scale_ptr + slot * stride_s + kv_head, so stride_s = num_kv_heads.
@@ -534,6 +634,8 @@ def decode_paged_attention(
         DV=head_dim,
         SLIDING_WINDOW=sliding_window or 0,
         Q8=q8,
+        VBITS=vbits,
+        BLOCK_VB=block_vb,
         num_warps=4,
         num_stages=2,
     )
@@ -598,6 +700,8 @@ def _extend_attention_kernel(
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
     Q8: tl.constexpr,
+    VBITS: tl.constexpr,
+    BLOCK_VB: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -682,14 +786,44 @@ def _extend_attention_kernel(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
-            if Q8:
-                # v is [BLOCK_N, BLOCK_DV] int8; per-(token, head) scale is [BLOCK_N].
+            if Q8 and VBITS < 8:
+                # Packed V slab: [BLOCK_N, BLOCK_VB] uint8 -> [BLOCK_N, BLOCK_DV] fp32.
+                offs_vb = tl.arange(0, BLOCK_VB)
+                vb = tl.load(
+                    v_ptr
+                    + slots[:, None] * stride_vs
+                    + kv_head * stride_vh
+                    + offs_vb[None, :],
+                    mask=mask_n[:, None] & (offs_vb[None, :] < D * VBITS // 8),
+                    other=0.0,
+                )
                 vs = tl.load(
                     v_scale_ptr + slots * stride_vscale_s + kv_head,
                     mask=mask_n,
                     other=0.0,
                 )
-                v = (v.to(tl.float32) * vs[:, None].to(tl.float32)).to(q_ptr.dtype.element_ty)
+                if VBITS == 4:
+                    v = _deq_v4(vb, vs, BLOCK_VB * 2, True)
+                else:
+                    v = _deq_v5(vb, vs, BLOCK_N, BLOCK_VB, BLOCK_DV, True)
+                v = v.to(q_ptr.dtype.element_ty)
+            else:
+                v = tl.load(
+                    v_ptr
+                    + slots[:, None] * stride_vs
+                    + kv_head * stride_vh
+                    + offs_dv[None, :],
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                )
+                if Q8:
+                    # v is [BLOCK_N, BLOCK_DV] int8; per-(token, head) scale is [BLOCK_N].
+                    vs = tl.load(
+                        v_scale_ptr + slots * stride_vscale_s + kv_head,
+                        mask=mask_n,
+                        other=0.0,
+                    )
+                    v = (v.to(tl.float32) * vs[:, None].to(tl.float32)).to(q_ptr.dtype.element_ty)
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
@@ -744,6 +878,8 @@ def _extend_attention_split_kernel(
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
     Q8: tl.constexpr,
+    VBITS: tl.constexpr,
+    BLOCK_VB: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -830,14 +966,44 @@ def _extend_attention_split_kernel(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
-            if Q8:
-                # v is [BLOCK_N, BLOCK_DV] int8; per-(token, head) scale is [BLOCK_N].
+            if Q8 and VBITS < 8:
+                # Packed V slab: [BLOCK_N, BLOCK_VB] uint8 -> [BLOCK_N, BLOCK_DV] fp32.
+                offs_vb = tl.arange(0, BLOCK_VB)
+                vb = tl.load(
+                    v_cache_ptr
+                    + slots[:, None] * stride_vcs
+                    + kv_head * stride_vch
+                    + offs_vb[None, :],
+                    mask=mask_n[:, None] & (offs_vb[None, :] < D * VBITS // 8),
+                    other=0.0,
+                )
                 vs = tl.load(
                     v_scale_ptr + slots * stride_vscale_s + kv_head,
                     mask=mask_n,
                     other=0.0,
                 )
-                v = (v.to(tl.float32) * vs[:, None].to(tl.float32)).to(q_ptr.dtype.element_ty)
+                if VBITS == 4:
+                    v = _deq_v4(vb, vs, BLOCK_VB * 2, True)
+                else:
+                    v = _deq_v5(vb, vs, BLOCK_N, BLOCK_VB, BLOCK_DV, True)
+                v = v.to(q_ptr.dtype.element_ty)
+            else:
+                v = tl.load(
+                    v_cache_ptr
+                    + slots[:, None] * stride_vcs
+                    + kv_head * stride_vch
+                    + offs_dv[None, :],
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                )
+                if Q8:
+                    # v is [BLOCK_N, BLOCK_DV] int8; per-(token, head) scale is [BLOCK_N].
+                    vs = tl.load(
+                        v_scale_ptr + slots * stride_vscale_s + kv_head,
+                        mask=mask_n,
+                        other=0.0,
+                    )
+                    v = (v.to(tl.float32) * vs[:, None].to(tl.float32)).to(q_ptr.dtype.element_ty)
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
@@ -937,7 +1103,8 @@ def extend_paged_attention(
     assert qo_indptr.numel() == kv_indptr.numel()
     assert prefix_lens.numel() == qo_indptr.numel() - 1
     assert v_cache.shape[1] == num_kv_heads
-    assert k_cache.shape[-1] == head_dim and v_cache.shape[-1] == head_dim
+    assert k_cache.shape[-1] == head_dim
+    vbits = _v_bits_from_slab(v_cache, head_dim)
     assert num_q_heads % num_kv_heads == 0
     if sinks is not None:
         assert sinks.is_cuda
@@ -949,6 +1116,7 @@ def extend_paged_attention(
     sinks_arg = sinks if sinks is not None else q
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)
+    block_vb = triton.next_power_of_2(head_dim * vbits // 8)
     # Tile size is shared-memory bound: keep the fast (large) tiles on GPUs whose opt-in
     # shared memory fits them, shrink on consumer GPUs (sm_89 ~99KB) where the default
     # 128x64 overflows once head_dim >= 256 (e.g. gemma4: SWA 256, full-attention 512).
@@ -1010,6 +1178,8 @@ def extend_paged_attention(
             SLIDING_WINDOW=sliding_window or 0,
             HAS_SINKS=sinks is not None,
             Q8=q8,
+            VBITS=vbits,
+            BLOCK_VB=block_vb,
             num_warps=8,
             num_stages=1,
         )
@@ -1047,6 +1217,8 @@ def extend_paged_attention(
         SLIDING_WINDOW=sliding_window or 0,
         HAS_SINKS=sinks is not None,
         Q8=q8,
+        VBITS=vbits,
+        BLOCK_VB=block_vb,
         num_warps=8,
         num_stages=1,
     )
@@ -1091,7 +1263,8 @@ def paged_attention(
         k_scale = k_scale.contiguous()
         v_scale = v_scale.contiguous()
     assert v_cache.shape[1] == num_kv_heads
-    assert k_cache.shape[-1] == head_dim and v_cache.shape[-1] == head_dim
+    assert k_cache.shape[-1] == head_dim
+    vbits = _v_bits_from_slab(v_cache, head_dim)
     assert num_q_heads % num_kv_heads == 0
     if sinks is not None:
         assert sinks.is_cuda
@@ -1102,6 +1275,7 @@ def paged_attention(
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
     block_d = triton.next_power_of_2(head_dim)
+    block_vb = triton.next_power_of_2(head_dim * vbits // 8)
     grid = (num_tokens, num_q_heads)
     # Q8 scale args (dummy when not Q8; the kernel never dereferences them then).
     if q8:
@@ -1142,6 +1316,8 @@ def paged_attention(
         SLIDING_WINDOW=sliding_window or 0,
         HAS_SINKS=sinks is not None,
         Q8=q8,
+        VBITS=vbits,
+        BLOCK_VB=block_vb,
         num_warps=8 if head_dim >= 256 else 4,
         num_stages=2,
     )

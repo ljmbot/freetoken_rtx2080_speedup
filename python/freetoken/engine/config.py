@@ -37,6 +37,11 @@ class EngineConfig:
     # scale (llama.cpp's Q8_0) instead of fp16. Halves KV VRAM. Dequantized in-kernel
     # before attention, so compute stays fp16. Off by default (byte-for-byte no-op).
     kv_q8: bool = False
+    # Sub-byte V quantization width (--kv-v-bits): packs the V slab to int4/int5
+    # (uint8) on top of --kv-q8's per-(token,head) fp32 scales. 8 = plain Q8_0
+    # (byte-for-byte no-op). 4 = 2 signed nibbles/byte, 5 = 8 fields per 5-byte
+    # group. Requires --kv-q8 (the scale machinery).
+    kv_v_bits: int = 8
     # Multi-Token-Prediction self-speculative decode (--mtp): the Qwen3.5 "nextn"
     # head drafts one token per step, verified by a 2-token base forward (k=1).
     # Off by default (byte-for-byte no-op). Requires --kv-q8 for VRAM at 64K context.

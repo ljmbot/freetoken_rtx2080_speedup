@@ -40,10 +40,10 @@ class KernelSpec:
     build: BuildFn
 
 
-def _store_spec(element_size: int) -> KernelSpec:
+def _store_spec(k_element_size: int, v_element_size: int) -> KernelSpec:
     from .store import DEFAULT_INDEX_KERNEL_CONFIG
 
-    args = make_cpp_args(element_size, *DEFAULT_INDEX_KERNEL_CONFIG)
+    args = make_cpp_args(k_element_size, v_element_size, *DEFAULT_INDEX_KERNEL_CONFIG)
 
     def build(build_directory: pathlib.Path) -> object:
         return load_jit(
@@ -145,7 +145,7 @@ def _radix_spec() -> KernelSpec:
 
 def default_kernel_specs() -> tuple[KernelSpec, ...]:
     specs: list[KernelSpec] = []
-    specs.extend(_store_spec(element_size) for element_size in DEFAULT_STORE_ELEMENT_SIZES)
+    specs.extend(_store_spec(*pair) for pair in DEFAULT_STORE_ELEMENT_SIZES)
     specs.extend(_index_spec(*variant) for variant in DEFAULT_INDEX_VARIANTS)
     specs.append(_fast_index_copy_update_flag_spec())
     specs.extend(

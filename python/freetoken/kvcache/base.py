@@ -72,6 +72,8 @@ class BaseKVCachePool(ABC):
         cost_kwargs = {}
         if "kv_q8" in cost_params:
             cost_kwargs["kv_q8"] = getattr(config, "kv_q8", False)
+        if "kv_v_bits" in cost_params:
+            cost_kwargs["kv_v_bits"] = getattr(config, "kv_v_bits", 8)
         cache_per_page, fixed_cache_size, _, _ = cls.kv_cost(config, **cost_kwargs)
         num_pages = config.num_page_override
         if num_pages is None:
