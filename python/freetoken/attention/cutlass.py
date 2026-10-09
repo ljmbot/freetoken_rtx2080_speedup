@@ -70,6 +70,38 @@ class CutlassAttentionBackend(TritonAttentionBackend):
             torch.ops.aten, "_scaled_dot_product_efficient_attention"
         )
 
+    @staticmethod
+    def _unpack_v(vb: torch.Tensor, head_dim: int) -> torch.Tensor:
+        """Unpack a packed sub-byte V tile to signed int values (int32).
+
+        Mirrors the Triton ``_deq_v4``/``_deq_v5`` helpers (and the inverse of
+        ``mha_pool._pack_v``). ``vb`` is ``[slots, kv_heads, v_dim]`` uint8 with
+        ``v_dim = head_dim * bits // 8``; returns ``[slots, kv_heads, head_dim]``
+        int32 in ``[-2^(bits-1), 2^(bits-1)-1]``. int4: two's-complement nibbles,
+        low nibble = field 2i (sign-extend ``(nib ^ 8) - 8``). int5: 8 fields per
+        5-byte group, field j at bit ``5j % 8`` of byte ``5j // 8``; a field
+        straddles the boundary when ``r > 3`` so stitch ``((b0 >> r) | (b1 <<
+        (8 - r))) & 0x1F`` and sign-extend ``(f ^ 16) - 16``.
+        """
+        v = vb.to(torch.int32)
+        w = v.shape[-1]
+        if w * 2 == head_dim:  # int4
+            lo = (v & 0xF) ^ 8
+            hi = (v >> 4) ^ 8
+            out = torch.stack([lo, hi], dim=-1).reshape(*v.shape[:-1], -1) - 8
+            return out
+        assert w * 8 == 5 * head_dim, f"unexpected V slab width {w} for head_dim {head_dim}"
+        # int5
+        j = torch.arange(head_dim, device=v.device, dtype=torch.int32)
+        b0i = (5 * j) >> 3
+        r = (5 * j) & 7
+        b0 = v.index_select(-1, b0i)
+        b1 = v.index_select(-1, (b0i + 1).clamp(max=w - 1))
+        lo = b0 >> r
+        hi = torch.where(r > 3, b1 << (8 - r), torch.zeros_like(b1))
+        f = (lo | hi) & 0x1F
+        return (f ^ 16) - 16
+
     def _dequant_kv(
         self,
         k_cache: torch.Tensor,
@@ -83,11 +115,17 @@ class CutlassAttentionBackend(TritonAttentionBackend):
 
         The Q8_0 cache is int8 with a per-(token, head) fp32 scale; the CUTLASS SDPA
         paths need fp16, so dequant the selected subset here (the Triton kernels
-        dequantize in-kernel instead). Returns ``(k, v)`` each ``[num_slots, kv_heads,
-        head_dim]`` in ``dtype``.
+        dequantize in-kernel instead). With sub-byte V (``--kv-v-bits 4/5``) the V
+        slab is packed uint8 (width ``head_dim*bits//8``) and is unpacked here
+        first — reading it as int8 values would silently mix two fields per byte.
+        Returns ``(k, v)`` each ``[num_slots, kv_heads, head_dim]`` in ``dtype``.
         """
         k = k_cache[slots].to(torch.float32)
-        v = v_cache[slots].to(torch.float32)
+        v_raw = v_cache[slots]
+        if v_raw.shape[-1] == k.shape[-1]:
+            v = v_raw.to(torch.float32)  # int8 V (v_bits=8)
+        else:
+            v = self._unpack_v(v_raw, k.shape[-1])  # packed int4/int5
         ks = k_scale_flat[slots].unsqueeze(-1)  # [num_slots, kv_heads, 1]
         vs = v_scale_flat[slots].unsqueeze(-1)
         return (k * ks).to(dtype), (v * vs).to(dtype)
@@ -355,7 +393,9 @@ class CutlassAttentionBackend(TritonAttentionBackend):
         kv_heads, head_dim = k_raw.shape[-2], k_raw.shape[-1]
         assert head_dim == q.shape[-1]
         k_cache = k_raw.view(-1, kv_heads, head_dim)
-        v_cache = v_raw.view(-1, kv_heads, head_dim)
+        # Packed sub-byte V (v_bits<8) rows are narrower than head_dim — view at
+        # the raw slab width (the kernels/_dequant_kv infer the bit width from it).
+        v_cache = v_raw.view(-1, kv_heads, v_raw.shape[-1])
 
         # Q8_0 KV cache: the cache is int8 + per-(token, head) fp32 scales. The Triton
         # kernels dequantize in-kernel (they take k_scale/v_scale); the CUTLASS SDPA
