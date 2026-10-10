@@ -58,6 +58,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.qwen3_5_moe",
         "Qwen3_5MoEForCausalLM",
     ),
+    # Qwen3-Next (model_type qwen3_next): flat text-only config (no text_config wrapper),
+    # same Qwen3.5-style hybrid GDN + full-attn MoE decoder as qwen3_5_moe. 80B-A3B
+    # (RedHatAI/Qwen3-Coder-Next-NVFP4) is compressed-tensors NVFP4 with the 2-part GDN
+    # in_proj layout (in_proj_qkvz | in_proj_ba) the qwen3_5_moe loader fuses layout-aware.
+    "Qwen3NextForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_5_moe",
+        "Qwen3_5MoEForCausalLM",
+    ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
     # qwen3_5_moe package: the decoder routes its MLP through the dense Qwen3_5DenseMLP and the
     # loader handles the compressed-tensors NVFP4 layout.

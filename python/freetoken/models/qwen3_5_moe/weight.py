@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -47,13 +48,15 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     layer_to_bank=lambda layer, config: layer,  # every layer is MoE
     desc="Qwen3.5 NVFP4 experts",
 )
-# compressed-tensors NVFP4 experts (Ornith): the same 6-bank layout, but the checkpoint
-# stores {weight_packed, weight_scale, weight_global_scale} instead of
+# compressed-tensors NVFP4 experts (Ornith / Coder-Next): the same 6-bank layout, but the
+# checkpoint stores {weight_packed, weight_scale, weight_global_scale} instead of
 # {weight, weight_scale, weight_scale_2}. The CT ``weight_global_scale`` is the *quant-side*
 # scale, so the bank must store its reciprocal (the dequant-side global the W4A16 kernels
-# multiply by) -- the same convention the dense pass (nvfp4_parts_ct) already applies.
+# multiply by) -- the same convention the dense pass (nvfp4_parts_ct) already applies. The
+# optional ``language_model.`` infix matches both the VLM wrapper (Ornith) and the flat
+# text-only config (Coder-Next: ``model.layers.…``).
 _NVFP4_EXPERT_KEY_RE_CT = re.compile(
-    r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"^model\.(?:language_model\.)?layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
     r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight_packed|weight_scale|weight_global_scale)$"
 )
 _NVFP4_SOURCE_SPEC_CT = Nvfp4ExpertSourceSpec(
@@ -607,6 +610,10 @@ _CT_NVFP4_FUSE: dict[str, tuple[str, ...]] = {
     ),
 }
 _CT_BF16_FUSE: dict[str, tuple[str, ...]] = {
+    # GDN in_proj (4-part Ornith default). Coder-Next stores the 2-part fused layout
+    # (in_proj_qkvz | in_proj_ba); that layout collides on this key, so
+    # _iter_weights_compressed_tensors overrides the entry per-checkpoint (see
+    # ct_bf16_fuse_groups). Both layouts concatenate to the model's [qkv|z|b|a] order.
     ".linear_attn.in_proj": (
         ".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z",
         ".linear_attn.in_proj_b", ".linear_attn.in_proj_a",
@@ -657,21 +664,31 @@ def _iter_weights_compressed_tensors(
     nvfp4_buf: dict[str, dict[int, tuple]] = {}
     bf16_buf: dict[str, dict[int, torch.Tensor]] = {}
 
+    # Scale lookups go through the shard-map reader: a weight_packed's quant scales
+    # can land in a different shard than the packed weight (the Muse-Glimmer layer-49
+    # shape; nothing prevents an llm-compressor Qwen export from splitting the same way).
+    reader = ShardReader(model_path, device)
+    # GDN in_proj layout is checkpoint-dependent: Ornith stores 4 parts
+    # (in_proj_qkv|in_proj_z|in_proj_b|in_proj_a); Coder-Next stores 2 fused parts
+    # (in_proj_qkvz|in_proj_ba). Both concatenate to the model's [qkv|z|b|a] split order
+    # (gdn.py), so the only difference is how the loader reassembles them. The in_proj
+    # group is a single dict key in _CT_BF16_FUSE, so the two layouts collide -- build a
+    # per-checkpoint groups dict with the detected part list.
+    gdn_in_proj_parts = _CT_GDN_IN_PROJ_PARTS  # 4-part default (Ornith)
+    if any(nm.endswith(".linear_attn.in_proj_qkvz.weight") for nm in reader._map):
+        gdn_in_proj_parts = (".linear_attn.in_proj_qkvz", ".linear_attn.in_proj_ba")
+    ct_bf16_fuse_groups = {**_CT_BF16_FUSE, ".linear_attn.in_proj": gdn_in_proj_parts}
+
     def _emit_bf16_weight(name: str, tensor: torch.Tensor):
         """Plain bf16 ``.weight``: GDN in_proj fusion, Gemma (1+w) norms, else passthrough."""
         base = name[: -len(".weight")]
-        emit = _ct_bf16_fuse(base, tensor, bf16_buf, _CT_BF16_FUSE)
+        emit = _ct_bf16_fuse(base, tensor, bf16_buf, ct_bf16_fuse_groups)
         if emit is not None:
             yield from emit
             return
         if _is_gemma_norm(name):
             tensor = tensor + 1.0  # (1 + weight) baked into the stored norm weight
         yield name, tensor
-
-    # Scale lookups go through the shard-map reader: a weight_packed's quant scales
-    # can land in a different shard than the packed weight (the Muse-Glimmer layer-49
-    # shape; nothing prevents an llm-compressor Qwen export from splitting the same way).
-    reader = ShardReader(model_path, device)
     try:
         for file in tqdm(
             reader.files(),
@@ -702,7 +719,7 @@ def _iter_weights_compressed_tensors(
                     # (e.g. sakamakismile/Qwen3.6-27B-NVFP4) quantize them too: dequant to
                     # bf16 here and let the bf16 fusion assemble ``in_proj`` as usual. Scoped
                     # to in_proj -- q/k/v of a dense NVFP4-attention build stay native below.
-                    if base.endswith(_CT_GDN_IN_PROJ_PARTS):
+                    if base.endswith(gdn_in_proj_parts):
                         bf16 = _dequant_nvfp4_weight(w, s, g[:1])
                         yield from _emit_bf16_weight(base + ".weight", bf16)
                         continue
@@ -796,10 +813,12 @@ _FP8_FUSIONS: dict[str, tuple[str, ...]] = {
 }
 _FP8_KIND_SUFFIXES = (".weight_scale_inv", ".weight")
 
-# Routed-expert checkpoint key (per-expert, un-fused). ``mtp.layers...`` is excluded by the
-# ``model.language_model.`` anchor, so the parallel reader only sees the real experts.
+# Routed-expert checkpoint key (per-expert, un-fused). The optional ``language_model.``
+# infix matches both the VLM wrapper (Ornith) and the flat text-only config (Coder-Next);
+# the leading ``^model\.`` anchor still excludes the MTP head's ``mtp.layers…`` tensors, so
+# the parallel reader only sees the real experts.
 _FP8_EXPERT_RE = re.compile(
-    r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"^model\.(?:language_model\.)?layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
     r"(?P<proj>gate|up|down)_proj\.(?P<kind>weight|weight_scale_inv)$"
 )
 
@@ -963,6 +982,43 @@ def _moe_dims(model_config):
     )
 
 
+@functools.lru_cache(maxsize=8)
+def _expert_key_prefix(model_path: str) -> str:
+    """The routed-expert key prefix for this checkpoint: ``model.language_model.`` (VLM
+    wrapper, e.g. Ornith) or ``model.`` (flat text-only config, e.g. Coder-Next). Discerned
+    from the index (a header scan for single-file checkpoints). The serial FP8 expert
+    loaders build keys by f-string (not regex), so they need the exact prefix. Defaults to
+    the Ornith prefix: a flat-prefix FP8 checkpoint would otherwise fail loudly on a missing
+    key rather than silently mis-load (no such checkpoint exists today)."""
+    import glob as _glob
+
+    folder = download_hf_weight(model_path)
+    names = None
+    index = os.path.join(folder, "model.safetensors.index.json")
+    if os.path.exists(index):
+        try:
+            with open(index, encoding="utf-8") as f:
+                names = list(json.load(f)["weight_map"].keys())
+        except (OSError, ValueError, KeyError):
+            names = None
+    if names is None:
+        names = []
+        for shard in sorted(_glob.glob(os.path.join(folder, "*.safetensors"))):
+            if shard.endswith("consolidated.safetensors"):
+                continue
+            try:
+                with open(shard, "rb") as fh:
+                    n = int.from_bytes(fh.read(8), "little")
+                    hdr = json.loads(fh.read(n))
+            except (OSError, ValueError):
+                continue
+            names.extend(nm for nm in hdr if nm != "__metadata__")
+    for nm in names:
+        if ".mlp.experts." in nm and nm.startswith("model."):
+            return "model.language_model." if nm.startswith("model.language_model.") else "model."
+    return "model.language_model."
+
+
 def _expert_reader(model_path, device):
     folder = download_hf_weight(model_path)
     with open(os.path.join(folder, "model.safetensors.index.json")) as fh:
@@ -1053,11 +1109,12 @@ def _build_fp8_expert_banks(
         else:
             reader = _expert_reader(model_path, torch.device("cpu"))
             primary = get_tp_info().is_primary()
+            prefix = _expert_key_prefix(model_path)
             try:
                 for li in tqdm(range(L), desc="Loading fp8 experts (serial)", disable=not primary):
                     layer = dense + li
                     for e in range(E):
-                        p = f"model.language_model.layers.{layer}.mlp.experts.{e}"
+                        p = f"{prefix}layers.{layer}.mlp.experts.{e}"
                         for proj in ("gate", "up", "down"):
                             for kind in ("weight", "weight_scale_inv"):
                                 key = f"{p}.{proj}_proj.{kind}"
@@ -1105,13 +1162,14 @@ def _setup_bf16_dequant_banks(model_path, model_config, device, dummy: bool, *, 
     def _load(sink) -> None:
         # Whole-layer gate_up + down copies -> 2 writes/layer.
         tracker = LayerCompletionTracker(2, hb, sink) if sink is not None else None
+        prefix = _expert_key_prefix(model_path)
         try:
             for li in tqdm(range(L), desc="Loading fp8 experts (dequant->bf16)", disable=not primary):
                 layer = dense + li
                 gu_rows = torch.empty(E, 2 * I, H, dtype=torch.bfloat16, device=device)
                 dn_rows = torch.empty(E, H, I, dtype=torch.bfloat16, device=device)
                 for e in range(E):
-                    p = f"model.language_model.layers.{layer}.mlp.experts.{e}"
+                    p = f"{prefix}layers.{layer}.mlp.experts.{e}"
                     gu_rows[e, :I] = _deq(f"{p}.gate_proj")
                     gu_rows[e, I:] = _deq(f"{p}.up_proj")
                     dn_rows[e] = _deq(f"{p}.down_proj")

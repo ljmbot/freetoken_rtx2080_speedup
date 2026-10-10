@@ -74,10 +74,12 @@ _compressed_tensors_nvfp4 = detect_compressed_tensors_nvfp4
 
 
 # Routed-expert NVFP4 tensor in a compressed-tensors checkpoint (per-expert, un-fused,
-# ``model.language_model.layers.N.mlp.experts.E.{gate,up,down}_proj.weight_packed``).
-# The ``model.language_model.`` anchor excludes the MTP head's ``mtp.layers.*`` tensors.
+# ``model[.language_model].layers.N.mlp.experts.E.{gate,up,down}_proj.weight_packed``).
+# The optional ``language_model.`` infix covers both the VLM wrapper (Ornith:
+# ``model.language_model.…``) and the flat text-only config (Coder-Next: ``model.…``);
+# the leading ``^model\.`` anchor still excludes the MTP head's ``mtp.layers.*`` tensors.
 _CT_EXPERT_NVFP4_RE = re.compile(
-    r"^model\.language_model\.layers\.\d+\.mlp\.experts\.\d+\.(?:gate|up|down)_proj\.weight_packed$"
+    r"^model\.(?:language_model\.)?layers\.\d+\.mlp\.experts\.\d+\.(?:gate|up|down)_proj\.weight_packed$"
 )
 
 
