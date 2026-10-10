@@ -240,10 +240,17 @@ def iter_weights(
     if _compressed_tensors_nvfp4(hf_config):
         # Dense compressed-tensors NVFP4 (e.g. Qwen3.6-27B): attn (q/k/v/o, GDN out_proj) +
         # dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms bf16.
+        from freetoken.models.config import LinearGatedDeltaGroupConfig
+
+        gdn_geom = None
+        for g in config.attention_groups:
+            if isinstance(g, LinearGatedDeltaGroupConfig):
+                gdn_geom = (g.num_key_heads, g.num_value_heads, g.key_head_dim, g.value_head_dim)
+                break
         yield from _iter_weights_compressed_tensors(
             model_path, device,
             include_non_moe=include_non_moe, include_moe_experts=include_moe_experts,
-            nvfp4=config.dense_quant == "nvfp4",
+            nvfp4=config.dense_quant == "nvfp4", gdn_geom=gdn_geom,
         )
         return
     if config.expert_quant == "fp8_block":
@@ -643,9 +650,37 @@ def _ct_nvfp4_fuse(base: str, parts_tuple: tuple, buf: dict):
     return ct_nvfp4_fuse(base, parts_tuple, buf, _CT_NVFP4_FUSE)
 
 
+def _deinterleave_gdn_in_proj(tensor: torch.Tensor, is_qkvz: bool, geom: tuple) -> torch.Tensor:
+    """Reorder a Qwen3Next 2-part GDN in_proj from its *interleaved per-k-head* storage into
+    the model's *block* order (gdn.py).
+
+    Qwen3Next (Coder-Next) stores ``in_proj_qkvz`` as ``[q_h k_h v_h z_h | q_{h+1} ...]``
+    (``2*hk + 2*(nv//nk)*hv`` rows per k-head) and ``in_proj_ba`` as ``[b_h a_h | ...]``
+    (``2*(nv//nk)`` rows per k-head) -- HF's ``fix_query_key_value_ordering`` reshapes to
+    ``[nk, ...]`` and splits per k-head. The GDN forward instead reads the fused ``in_proj``
+    as block order ``[q_all|k_all|v_all|z_all|b|a]``. Ornith (Qwen3.5) stores 4 separate
+    block-order tensors, so its fusion is already block order and never needs this. Verified
+    bit-exact against HF's ``fix_query_key_value_ordering`` on Coder-Next layer 0."""
+    nk, nv, hk, hv = geom
+    hidden = tensor.shape[1]
+    g = nv // nk
+    if is_qkvz:
+        t = tensor.view(nk, 2 * hk + 2 * hv * g, hidden)
+        q = t[:, 0:hk, :]
+        k = t[:, hk:2 * hk, :]
+        v = t[:, 2 * hk:2 * hk + hv * g, :]
+        z = t[:, 2 * hk + hv * g:, :]
+        return torch.cat([q.reshape(nk * hk, hidden), k.reshape(nk * hk, hidden),
+                          v.reshape(nv * hv, hidden), z.reshape(nv * hv, hidden)], dim=0)
+    t = tensor.view(nk, 2 * g, hidden)
+    b = t[:, 0:g, :]
+    a = t[:, g:, :]
+    return torch.cat([b.reshape(nv, hidden), a.reshape(nv, hidden)], dim=0)
+
+
 def _iter_weights_compressed_tensors(
     model_path: str, device: torch.device, *, include_non_moe: bool, include_moe_experts: bool,
-    nvfp4: bool,
+    nvfp4: bool, gdn_geom: tuple | None = None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Dense pass for a compressed-tensors NVFP4 checkpoint (e.g. Qwen3.6-27B).
 
@@ -675,13 +710,20 @@ def _iter_weights_compressed_tensors(
     # group is a single dict key in _CT_BF16_FUSE, so the two layouts collide -- build a
     # per-checkpoint groups dict with the detected part list.
     gdn_in_proj_parts = _CT_GDN_IN_PROJ_PARTS  # 4-part default (Ornith)
+    gdn_interleaved = False  # True for the Qwen3Next 2-part layout (needs de-interleaving)
     if any(nm.endswith(".linear_attn.in_proj_qkvz.weight") for nm in reader._map):
         gdn_in_proj_parts = (".linear_attn.in_proj_qkvz", ".linear_attn.in_proj_ba")
+        gdn_interleaved = True
     ct_bf16_fuse_groups = {**_CT_BF16_FUSE, ".linear_attn.in_proj": gdn_in_proj_parts}
 
     def _emit_bf16_weight(name: str, tensor: torch.Tensor):
         """Plain bf16 ``.weight``: GDN in_proj fusion, Gemma (1+w) norms, else passthrough."""
         base = name[: -len(".weight")]
+        # Qwen3Next stores in_proj_qkvz / in_proj_ba interleaved per k-head; the GDN forward
+        # reads block order. Reorder each part before the bf16 fusion concatenates them.
+        if gdn_interleaved and gdn_geom is not None and base.endswith(gdn_in_proj_parts):
+            tensor = _deinterleave_gdn_in_proj(
+                tensor, base.endswith(".in_proj_qkvz"), gdn_geom)
         emit = _ct_bf16_fuse(base, tensor, bf16_buf, ct_bf16_fuse_groups)
         if emit is not None:
             yield from emit
