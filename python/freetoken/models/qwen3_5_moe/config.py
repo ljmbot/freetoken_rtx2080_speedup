@@ -165,6 +165,28 @@ def _ct_module_signal(name: str, result: dict[str, bool]) -> None:
         result["dense_mlp_nvfp4"] = True
 
 
+def _ftw_quant_layout(hf_config: Any) -> dict | None:
+    """For an FTW checkpoint, the quant layout the converter resolved from the source
+    safetensors (baked into the FTW index meta). The source safetensors are deleted once the
+    FTW is in place, so the compressed-tensors module layout can no longer be re-scanned -- the
+    converter records the resolved fields and we replay them here so an FTW resolves the same
+    dense_quant/attn_quant/... as its safetensors source. Returns the layout dict, or None when
+    the checkpoint is not an FTW (or the meta is absent/invalid)."""
+    p = _ct_checkpoint_path(hf_config)
+    if p is None:
+        return None
+    from freetoken.checkpoint.ftw import INDEX_NAME, is_ftw_checkpoint
+
+    if not is_ftw_checkpoint(p):
+        return None
+    try:
+        with open(os.path.join(p, INDEX_NAME), encoding="utf-8") as f:
+            layout = json.load(f).get("quant_layout")
+        return layout if isinstance(layout, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
 def _lm_head_quant(hf_config: Any) -> str:
     """Whether the checkpoint stores ``lm_head`` as NVFP4. modelopt MIXED_PRECISION lists it in
     the per-layer ``quantized_layers`` map (``W4A16_NVFP4``); pure-NVFP4 checkpoints have no
@@ -288,13 +310,24 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # out_proj dense bf16. Wire the W4A16 kernels per module accordingly (attn_quant=="nvfp4"
     # routes the full-attention linears through them; gdn_quant=="nvfp4" routes GDN out_proj).
     if _compressed_tensors_nvfp4(hf_config):
-        m = _ct_nvfp4_module_map(_ct_checkpoint_path(hf_config) or "")
-        if m["has_moe_experts_nvfp4"]:
-            expert_quant = "nvfp4"  # MoE: routed experts are NVFP4 (offload cache)
-        attn_quant = "nvfp4" if m["self_attn_nvfp4"] else "none"
-        gdn_quant = "nvfp4" if m["gdn_outproj_nvfp4"] else "none"
-        dense_quant = "nvfp4" if (m["shared_expert_nvfp4"] or m["dense_mlp_nvfp4"]) else "none"
-        lm_head_quant = "none"
+        # An FTW checkpoint has no source safetensors left to scan, so the layout the
+        # converter resolved (baked into the FTW index meta) is authoritative. A raw
+        # safetensors checkpoint falls back to scanning the tensor layout.
+        layout = _ftw_quant_layout(hf_config)
+        if layout is not None:
+            expert_quant = layout.get("expert_quant", "none")
+            attn_quant = layout.get("attn_quant", "none")
+            gdn_quant = layout.get("gdn_quant", "none")
+            dense_quant = layout.get("dense_quant", "none")
+            lm_head_quant = layout.get("lm_head_quant", "none")
+        else:
+            m = _ct_nvfp4_module_map(_ct_checkpoint_path(hf_config) or "")
+            if m["has_moe_experts_nvfp4"]:
+                expert_quant = "nvfp4"  # MoE: routed experts are NVFP4 (offload cache)
+            attn_quant = "nvfp4" if m["self_attn_nvfp4"] else "none"
+            gdn_quant = "nvfp4" if m["gdn_outproj_nvfp4"] else "none"
+            dense_quant = "nvfp4" if (m["shared_expert_nvfp4"] or m["dense_mlp_nvfp4"]) else "none"
+            lm_head_quant = "none"
 
     # Dense variants (e.g. Qwen3.6-27B) report num_experts==0: route the decoder MLP through
     # the dense Qwen3_5DenseMLP instead of the MoE block.

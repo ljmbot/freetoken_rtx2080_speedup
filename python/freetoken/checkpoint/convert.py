@@ -285,6 +285,19 @@ def convert_checkpoint(
     index = writer.finalize({
         "source_model_path": os.path.abspath(model_path),
         "fingerprint": fingerprint,
+        # quant_layout: the quant fields the config resolved from the source checkpoint's
+        # tensor layout (compressed-tensors NVFP4 module map). Recorded so an FTW -- whose
+        # source safetensors are deleted once it's in place -- resolves the same
+        # dense_quant/attn_quant/... at load (parse_config replays this; see
+        # qwen3_5_moe.config._ftw_quant_layout). Non-CT checkpoints keep the modelopt
+        # config-driven path, so the fields are only replayed when they were layout-derived.
+        "quant_layout": {
+            "expert_quant": getattr(mc, "expert_quant", "none"),
+            "attn_quant": getattr(mc, "attn_quant", "none"),
+            "gdn_quant": getattr(mc, "gdn_quant", "none"),
+            "dense_quant": getattr(mc, "dense_quant", "none"),
+            "lm_head_quant": getattr(mc, "lm_head_quant", "none"),
+        },
         # quant_format records the actual on-disk bank layout (e.g. nvfp4_marlin vs
         # nvfp4_b12x): the suffix is a runtime backend pick (GPU capability / env), NOT in
         # config, and the stored bytes are physically repacked into it -- so it's kept and
