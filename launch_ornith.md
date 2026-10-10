@@ -92,3 +92,60 @@ launch and then serves an OpenAI-compatible API at `http://localhost:8888/v1`.
 curl -s http://localhost:8888/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"Ornith-1.0-35B-PLAIN-NVFP4","messages":[{"role":"user","content":"Reply with exactly: OK"}],"max_tokens":8}'
 ```
+
+## Launching Qwen3-Coder-Next-NVFP4 (80B-A3B)
+
+The same sm75 path serves the larger **80B-A3B
+[Qwen3-Coder-Next-NVFP4](https://huggingface.co/RedHatAI/Qwen3-Coder-Next-NVFP4)**
+(Qwen3Next MoE: 48 layers — 12 full-attention + 36 GDN — 512 experts, top-10).
+Everything above applies except:
+
+- **Much more RAM is needed.** Coder-Next offloads **~43.5 GB of experts** to
+  host memory (Ornith offloads ~18 GB). On a 46 GB-RAM machine that leaves only
+  ~2–3 GB of headroom, so expert fetches will thrash the page cache under
+  load — that, not VRAM, is the real decode-speed risk. A 64 GB RAM machine
+  removes the risk.
+- **Tighter VRAM budget.** The expert cache is larger, so the 64K ceiling
+  moves: use `--moe-cache-size 1078` (not 950) with a **72K** context. That
+  fits at init (~7.9 GiB used) but peaks right at the 8 GB edge — if it OOMs,
+  step `--moe-cache-size` down to ~1000 or the context to ~64K.
+
+```bash
+export FREETOKEN_E1_CUBLAS=1
+export FREETOKEN_E3_CUBLAS=1
+export FREETOKEN_E3_GROUP=16
+export FREETOKEN_GDN_SM75_TUNE=1
+export FREETOKEN_LOAD_VISION=0      # Coder-Next is text-only; harmless no-op
+export PATH="$PWD/.venv/bin:$PATH"
+
+ft serve \
+ --model RedHatAI/Qwen3-Coder-Next-NVFP4 \
+ --served-model-name Qwen3-Coder-Next-NVFP4 \
+ --dtype float16 \
+ --attention-backend cutlass \
+ --moe-backend offload \
+ --nvfp4-backend triton \
+ --expert-load serial \
+ --moe-cache-size 1078 \
+ --disable-moe-prefill-overlap \
+ --memory-ratio 0.95 \
+ --num-tokens 72000 \
+ --max-seq-len-override 72000 \
+ --max-output-tokens 16000 \
+ --max-prefill-length 4096 \
+ --max-running-requests 1 \
+ --cuda-graph-max-bs 1 \
+ --cache-type naive \
+ --enable-cache-report \
+ --kv-q8 \
+ --kv-v-bits 5 \
+ --sampling-defaults model \
+ --temperature 0.5 \
+ --reasoning-parser auto \
+ --host 0.0.0.0 \
+ --port 8888
+```
+
+The only new switch vs Ornith is `--kv-v-bits 5` (K8V5): pack the V slab to
+5 bits on top of `--kv-q8` to claw back the extra KV the larger model needs.
+Run **console-only** (no desktop session) as with Ornith.

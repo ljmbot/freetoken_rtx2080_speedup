@@ -18,13 +18,18 @@ Unlock datacenter-class intelligence on the hardware you already own — Run 290
 This is a fork of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken),
 cloned at its `sm75` branch (commit `35668da`, "fix(cuda): support Turing GPUs"
 from [PR #24](https://github.com/FlashML-org/FreeToken/pull/24) by Lukas Rakauskas),
-plus the sm75 work below on top. It runs
-**RedHat (Neural Magic)
+plus the sm75 work below on top. It runs **RedHat (Neural Magic)
 [Ornith-1.0-35B-NVFP4](https://huggingface.co/RedHatAI/Ornith-1.0-35B-NVFP4)**
 (35B Qwen3.5-MoE, W4A4 NVFP4) on **8 GB Turing GPUs (RTX 2080/2080 Ti, sm75)**
 with a **64K context window**. On an RTX 2080 we measured ~55 tok/s prefill,
 ~55 tok/s decode, and 7.4 GB peak VRAM. [launch_ornith.md](launch_ornith.md)
 has the full command, every `--switch`/env var, and tuning notes.
+
+It also runs **RedHat (Neural Magic)
+[Qwen3-Coder-Next-NVFP4](https://huggingface.co/RedHatAI/Qwen3-Coder-Next-NVFP4)**
+(80B-A3B Qwen3Next MoE, W4A4 NVFP4) — a larger, coding-focused model — on the
+same 8 GB sm75 path with expert offload, verified end-to-end (see
+[launch_ornith.md](launch_ornith.md) for the shared sm75 launch pattern).
 
 Why Ornith is the model to run here: on the hard agent task "write JavaScript
 that computes pi to 100 decimal places", Qwen3.6-35B-A3B-Q4 loops without
@@ -47,9 +52,33 @@ What changed:
   net recurrence is ~4.5x faster on sm75, with bit-identical output.
 - **Q8 KV cache** (`--kv-q8`): int8 paged KV with per-head scales, dequantized
   in-kernel. KV memory is halved, which is what makes 64K fit on 8 GB.
+- **Sub-byte V KV cache** (`--kv-v-bits {4,5,8}`, on top of `--kv-q8`): the V
+  slab is packed to 4 or 5 bits per element (K stays int8), saving another
+  ~50% (4-bit) or ~37% (5-bit) of V memory. Per-(token,head) fp32 scales are
+  kept, so quality loss is minimal. K8V5 (5-bit V) is the recommended
+  long-context setting on 8 GB.
 - **Ornith model support**: loader, weight mapping, and model files for the
   compressed-tensors NVFP4 format (Qwen3.5-MoE). Set
   `FREETOKEN_LOAD_VISION=0` to skip the vision tower for text-only serving.
+- **Qwen3-Coder-Next (Qwen3Next) support**: the 80B-A3B
+  `Qwen3NextForCausalLM` MoE is served through the same `qwen3_5_moe` model
+  family. Qwen3Next stores its Gated DeltaNet `in_proj` as two interleaved
+  halves; the loader de-interleaves them into block order so the GDN
+  recurrence reads the right weights (a silent-corruption bug if left
+  unsplit).
+- **FTW fast-weight format self-describes its quant layout**: the FTW
+  converter records the resolved per-module quantization (NVFP4 vs bf16 for
+  experts / attention / GDN / dense / lm_head) in the FTW index, and the
+  loader replays it. Before this, converting a compressed-tensors NVFP4 model
+  to FTW (and deleting the source safetensors) lost the layout info, so the
+  model fell back to the wrong (bf16) dense modules and failed to boot.
+- **`--temperature`**: server-level default sampling temperature for requests
+  that don't set one (explicit per-request values win).
+- **`--mtp` self-speculative decode** (off by default): uses the Qwen3.5
+  `nextn` head to draft one token per step, verified by a 2-token base
+  forward. Correct, but on this hardware the eager verify path is slower than
+  graphed decode, so it's provided for experimentation, not enabled by
+  default.
 
 ## About
 
