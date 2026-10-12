@@ -23,6 +23,7 @@ export FREETOKEN_E3_GROUP=16        # bounds the fp16 dequant transient to fit 8
 export FREETOKEN_GDN_SM75_TUNE=1    # sm75-tuned GDN recurrence tiles (~4.5x faster)
 export FREETOKEN_LOAD_VISION=0      # text-only: skip the vision tower (~0.83 GiB)
 export PATH="$PWD/.venv/bin:$PATH"  # JIT store kernel needs ninja from the venv
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  # cuts allocator fragmentation at the 8 GB edge
 
 ft serve \
  --model RedHatAI/Ornith-1.0-35B-NVFP4 \
@@ -32,16 +33,16 @@ ft serve \
  --moe-backend offload \
  --nvfp4-backend triton \
  --expert-load serial \
- --moe-cache-size 950 \
+ --moe-cache-size 970 \
  --disable-moe-prefill-overlap \
  --memory-ratio 0.95 \
- --num-tokens 64000 \
- --max-seq-len-override 64000 \
+ --num-tokens 65536 \
+ --max-seq-len-override 65536 \
  --max-output-tokens 16000 \
  --max-prefill-length 4096 \
  --max-running-requests 1 \
  --cuda-graph-max-bs 1 \
- --cache-type naive \
+ --cache-type radix \
  --enable-cache-report \
  --kv-q8 \
  --sampling-defaults model \
@@ -63,11 +64,11 @@ launch and then serves an OpenAI-compatible API at `http://localhost:8888/v1`.
 | Switch / env | Purpose |
 |---|---|
 | `--attention-backend cutlass` | Uses PyTorch's CUTLASS memory-efficient SDPA for prefill (~10–13x faster than the Triton extend kernel at production geometry). A built-in VRAM guard bails to the Triton kernel automatically if a long-context expansion would not fit — no OOMs. Decode always uses the Triton paged kernel. |
-| `--moe-cache-size 950` | Number of MoE experts resident in GPU memory. **950 is the exact 64K-context ceiling on 8 GB** (the cache budget is ~2.8 GiB; 955 is rejected). Lower it (e.g. 512) to free VRAM for a bigger context or longer outputs; raise it only on >8 GB cards. |
-| `--num-tokens 64000` + `--max-seq-len-override 64000` | 64K context window. |
+| `--moe-cache-size 970` | Number of MoE experts resident in GPU memory. **970 is the measured safe ceiling for `radix` at 64K on 8 GB** (16K-prefill peak 7772 MiB vs the 7782 MiB usable; 1024 boots fine but OOMs mid-prefill — startup "free memory" is NOT a safe fit indicator, gate bumps on a 16K-prefill peak). With `--cache-type naive` the ceiling is ~950 (955 is rejected; radix's 9-slot GDN state pool costs ~430 MiB more, funded by the expert cut). Lower it (e.g. 512) to free VRAM for a bigger context or longer outputs; raise it only on >8 GB cards. |
+| `--num-tokens 65536` + `--max-seq-len-override 65536` | 64K context window. |
 | `--max-prefill-length 4096` | Prefill chunk size. 4096 cuts time-to-first-token (~15% faster prefill than 2048, ~+190 MiB peak). Do not raise further on 8 GB — GDN + attention cost is super-linear in chunk length. |
 | `--kv-q8` | Stores the paged K/V cache in Q8_0 (int8 + per-head scale) instead of fp16 — halves KV VRAM; dequantized in-kernel so compute stays fp16. Required for the 64K budget on 8 GB. |
-| `--cache-type naive` | Simple page cache (no radix tree) — less overhead for single-request serving. Use `radix` for heavy prefix reuse. |
+| `--cache-type radix` | Radix-tree prefix caching — **recommended for chat/multi-turn**: a request whose prompt shares a prefix with a cached conversation skips the entire forward for the cached tokens (MoE FFN + attention, all 40 layers), ~6x end-to-end on a 16K-history turn. Cost: the GDN (Mamba-style) state pool grows 2 → 9 slots (~123 → ~553 MiB), funded by cutting ~108 experts (1078 → 970) ≈ −3 tok/s decode. Use `naive` for one-shot unique-prompt workloads (zero prefix reuse): max expert residency, ~30 tok/s decode. |
 | `--expert-load serial` | Streams experts one at a time (lowest peak during load). |
 | `--disable-moe-prefill-overlap` | Disables the prefill double-buffer (its extra buffers don't fit 8 GB at 64K). |
 | `--memory-ratio 0.95` | Fraction of VRAM the engine may use. |
@@ -76,6 +77,18 @@ launch and then serves an OpenAI-compatible API at `http://localhost:8888/v1`.
 | `FREETOKEN_E3_GROUP=16` | Processes experts in groups of 16 so the fp16 dequant working set fits 8 GB. |
 | `FREETOKEN_GDN_SM75_TUNE=1` | sm75-tuned tile configs for the GDN (gated delta net) recurrence kernels — ~4.5x faster, bit-identical. No-op elsewhere. |
 | `FREETOKEN_LOAD_VISION=0` | Skip loading the vision tower (Ornith is multimodal; text-only serving). |
+| `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | Cuts allocator fragmentation; needed to land 970 experts under the 7782 MiB peak ceiling at the 8 GB edge. |
+
+## Measured performance (RTX 2080, console-only, 2026-10-12)
+
+| Config | Prefill (unique 16K) | Prefill (multi-turn, 16K history) | Decode (2048-token soak) | Peak VRAM (16K prefill) |
+|---|---|---|---|---|
+| `radix`, 970 experts, 64K (above) | ~400 tok/s | ~6x faster e2e (prefix hit skips the cached forward) | 26–27 tok/s | 7772 MiB |
+| `naive`, 1078 experts, 72K | ~385 tok/s | no prefix reuse (full re-prefill) | ~30 tok/s | 7652 MiB |
+
+Unique-prompt prefill is at parity between the two cache types; the radix win
+exists only when requests share conversation history. Decode tracks expert
+residency (~3.05 MiB/expert): 950 → 25–26, 970 → 26–27, 1078 → ~30 tok/s.
 
 ## Tuning for other GPUs
 
