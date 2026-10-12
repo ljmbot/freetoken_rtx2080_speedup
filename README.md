@@ -11,7 +11,7 @@
 </p>
 
 
-Unlock datacenter-class intelligence on the hardware you already own — Run 290B+ frontier MoE models locally on your gaming PC at blistering interactive speeds.
+Run 290B+ frontier MoE models locally on the hardware you already own.
 
 ## sm75 / 8 GB improvements (this fork)
 
@@ -25,15 +25,15 @@ with a **64K context window**. On an RTX 2080 we measured ~55 tok/s prefill,
 ~55 tok/s decode, and 7.4 GB peak VRAM. [launch_ornith.md](launch_ornith.md)
 has the full command, every `--switch`/env var, and tuning notes.
 
-It also runs **RedHat (Neural Magic)
+It also runs the larger, coding-focused **RedHat (Neural Magic)
 [Qwen3-Coder-Next-NVFP4](https://huggingface.co/RedHatAI/Qwen3-Coder-Next-NVFP4)**
-(80B-A3B Qwen3Next MoE, W4A4 NVFP4) — a larger, coding-focused model — on the
-same 8 GB sm75 path with expert offload, verified end-to-end (see
-[launch_ornith.md](launch_ornith.md) for the shared sm75 launch pattern).
+(80B-A3B Qwen3Next MoE, W4A4 NVFP4) on the same 8 GB sm75 path with expert
+offload, verified end-to-end (see [launch_ornith.md](launch_ornith.md) for the
+launch pattern).
 
 Why Ornith is the model to run here: on the hard agent task "write JavaScript
 that computes pi to 100 decimal places", Qwen3.6-35B-A3B-Q4 loops without
-converging, while Ornith converges on both its variants (AEON and plain) —
+converging, while Ornith converges on both its variants (AEON and plain),
 verified by executing the generated code against true pi. If you care about
 reliable multi-step math and coding on a Turing card, this is the pairing that
 works.
@@ -82,12 +82,12 @@ What changed:
 
 ## About
 
-FreeToken is an edge-native Mixture-of-Experts (MoE) serving engine designed for running frontier-scale open-weight models on personal and consumer hardware. It treats heterogeneous edge resources—GPUs, CPUs, host memory, and interconnects—as a unified, elastic inference platform. Its core features include:  
+FreeToken is an edge-native Mixture-of-Experts (MoE) serving engine for running frontier-scale open-weight models on personal and consumer hardware. It treats GPUs, CPUs, host memory, and interconnects as one pool of resources. Its core features:  
 
 - **Fast Edge-Native Runtime**: Provides efficient MoE serving with bandwidth-adaptive CPU–GPU co-execution ($q^\star$ policy), full-layer double-buffered prefill streaming, global LRU expert caching, graph-compatible execution, and the FTW fast weight format.  
-- **Semantic-Aware Caching**: Features semantic anchor checkpoints for recurrent state and KV caches, allowing agentic context edits (e.g., tool calls, thinking blocks) to avoid redundant context recomputation.  
+- **Semantic-Aware Caching**: Has semantic anchor checkpoints for recurrent state and KV caches, so agentic context edits (e.g., tool calls, thinking blocks) skip redundant context recomputation.  
 - **Elastic Memory Management**: Supports dynamic, runtime VRAM re-allocation between expert caches and KV memory without engine restarts or weight reloading.  
-- **Broad MoE & Ecosystem Support**: Supports frontier open-weight MoE models (e.g., DeepSeek-V4-Flash, Qwen3.6-35B-A3B, GLM-5.2) across various parameter scales and quantization formats (e.g., MXFP4, NVFP4, FP8, BF16), with Anthropic/OpenAI-compatible APIs for seamless integration with real-world coding and tool-calling agents (e.g., Codex, Claude Code, OpenCode, OpenClaw, DeepSeek Harness). 
+- **Broad MoE & Ecosystem Support**: Supports frontier open-weight MoE models (e.g., DeepSeek-V4-Flash, Qwen3.6-35B-A3B, GLM-5.2) across various parameter scales and quantization formats (e.g., MXFP4, NVFP4, FP8, BF16), with Anthropic/OpenAI-compatible APIs for coding and tool-calling agents (Codex, Claude Code, OpenCode, OpenClaw, DeepSeek Harness).  
 - **Diverse Consumer Hardware**: Scales across consumer laptops, gaming desktops, and workstation GPUs, with native support for NVIDIA RTX 30, RTX 40, and RTX 50 series GPUs.  
 
 ## Getting Started
@@ -116,7 +116,7 @@ uv venv && source .venv/bin/activate
 uv pip install -e ".[accel]"
 ```
 
-For More details:
+For more details:
 
 - [Install FreeToken](https://github.com/FlashML-org/FreeToken/blob/main/docs/install.md)
 - [Quick start](https://github.com/FlashML-org/FreeToken/blob/main/docs/quickstart.md)
