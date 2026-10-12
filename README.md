@@ -21,8 +21,11 @@ from [PR #24](https://github.com/FlashML-org/FreeToken/pull/24) by Lukas Rakausk
 plus the sm75 work below on top. It runs **RedHat (Neural Magic)
 [Ornith-1.0-35B-NVFP4](https://huggingface.co/RedHatAI/Ornith-1.0-35B-NVFP4)**
 (35B Qwen3.5-MoE, W4A4 NVFP4) on **8 GB Turing GPUs (RTX 2080/2080 Ti, sm75)**
-with a **64K context window**. On an RTX 2080 we measured ~55 tok/s prefill,
-~55 tok/s decode, and 7.4 GB peak VRAM. [launch_ornith.md](launch_ornith.md)
+with a **64K context window**. On an RTX 2080 we measured ~400 tok/s prefill
+(16K prompt, 4096-token chunks), ~26 tok/s decode, and 7.6 GB peak VRAM, with
+radix prefix caching (`--cache-type radix`, 9 GDN/Mamba state slots, 970
+cached experts): multi-turn requests that share conversation history skip the
+cached prefill entirely (~6x end-to-end on a 16K-history turn). [launch_ornith.md](launch_ornith.md)
 has the full command, every `--switch`/env var, and tuning notes.
 
 It also runs the larger, coding-focused **RedHat (Neural Magic)
