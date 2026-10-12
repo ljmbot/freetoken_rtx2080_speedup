@@ -73,37 +73,45 @@ passes every Phase G gate. It is **not** a change to the sm_89+ or decode paths.
 
 ## Layout
 
-- `scripts/sm75/` — serve wrappers (`serve-baseline.sh`, `serve-e1.sh`,
+The experiment harness lives in the git-ignored `rnd/` tree (kept for
+reproducibility, **not part of the release** — see `rnd/instrumentation/README.md`):
+
+- `rnd/sm75-scripts/` — serve wrappers (`serve-baseline.sh`, `serve-e1.sh`,
   `serve-e3.sh`), `bench.py` harness, `e_experts_edge_matrix.py` (Phase G
   correctness), Phase B/E probes.
-- `artifacts/sm75-prefill/` — `STATUS.md`, `final-report.md`, `profile-summary.md`,
-  `results.jsonl` (baseline), `results-e1.jsonl`, `results-e3.jsonl`,
-  `results-g.jsonl` (Phase G re-run), `summary.csv`, `launch-candidate.sh`,
-  `rollback.md`, `build.log`, `environment-candidate.txt`, `e3-edge-matrix-results.md`,
-  `test-results/`, `traces/`.
+- `rnd/artifacts/sm75-prefill/` — `STATUS.md`, `final-report.md`,
+  `profile-summary.md`, `results.jsonl` (baseline), `results-e1.jsonl`,
+  `results-e3.jsonl`, `results-g.jsonl` (Phase G re-run), `summary.csv`,
+  `launch-candidate.sh`, `rollback.md`, `build.log`,
+  `environment-candidate.txt`, `e3-edge-matrix-results.md`, `test-results/`,
+  `traces/`.
 - `docs/sm75-prefill.md` — this file.
+
+For the current shipping launch (Ornith on 8 GB, radix prefix cache, 970
+experts), see [../launch_ornith.md](../launch_ornith.md) — the E1/E3/GDN
+paths described here are the kernels that launch uses.
 
 ## Reproduce
 
 ```bash
 # install (re-runnable)
-bash ~/src/freetoken-sm75-native-prefill/scripts/sm75/setup-venv.sh
+bash ~/src/freetoken-sm75-native-prefill/rnd/sm75-scripts/setup-venv.sh
 
 # serve the candidate (E1+E3, loopback:1920)
-bash ~/src/freetoken-sm75-native-prefill/artifacts/sm75-prefill/launch-candidate.sh
+bash ~/src/freetoken-sm75-native-prefill/rnd/artifacts/sm75-prefill/launch-candidate.sh
 
 # benchmark (7 workloads, 5 reps + 1 warmup)
 ~/src/freetoken-sm75-native-prefill/.venv/bin/python \
-  ~/src/freetoken-sm75-native-prefill/scripts/sm75/bench.py \
+  ~/src/freetoken-sm75-native-prefill/rnd/sm75-scripts/bench.py \
   --host 127.0.0.1 --port 1920 \
   --model ~/Models/Qwen3.6-35B-A3B-NVFP4 \
   --variant candidate --reps 5 --warmup 1 \
-  --out ~/src/freetoken-sm75-native-prefill/artifacts/sm75-prefill/results-g.jsonl
+  --out ~/src/freetoken-sm75-native-prefill/rnd/artifacts/sm75-prefill/results-g.jsonl
 
 # correctness edge-case matrix (no server needed)
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   ~/src/freetoken-sm75-native-prefill/.venv/bin/python \
-  ~/src/freetoken-sm75-native-prefill/scripts/sm75/e_experts_edge_matrix.py
+  ~/src/freetoken-sm75-native-prefill/rnd/sm75-scripts/e_experts_edge_matrix.py
 ```
 
 ## Rollback
