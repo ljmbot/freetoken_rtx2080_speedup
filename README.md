@@ -34,6 +34,13 @@ It also runs the larger, coding-focused **RedHat (Neural Magic)
 offload, verified end-to-end (see [launch_ornith.md](launch_ornith.md) for the
 launch pattern).
 
+**Who did the sm75 work:** the rework in this fork — native sm75 prefill, radix
+prefix caching, the expert-cache policy, and the 8 GB tuning — was developed by
+**qwen3.8 (27B, aka flash-next)**, an AI coding agent running under
+[Hermes Agent](https://hermes-agent.nousresearch.com), with
+[ljmbot](https://github.com/ljmbot) directing the work, supplying the hardware,
+and validating every measurement on the card.
+
 Why Ornith is the model to run here: on the hard agent task "write JavaScript
 that computes pi to 100 decimal places", Qwen3.6-35B-A3B-Q4 loops without
 converging, while Ornith converges on both its variants (AEON and plain),
